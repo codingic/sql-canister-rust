@@ -58,6 +58,77 @@ impl<'a> Parser<'a> {
     fn parse_select(&mut self) -> Result<Statement> {
         self.expect(TokenType::Select)?;
 
+        let left = self.parse_select_core(false)?;
+        let mut parts = Vec::new();
+
+        while let Some(operator) = self.parse_compound_operator()? {
+
+            self.expect(TokenType::Select)?;
+            let select = self.parse_select_core(false)?;
+            parts.push(CompoundSelectPart { operator, select });
+        }
+
+        if parts.is_empty() {
+            return Ok(Statement::Select(self.parse_select_tail(left)?));
+        }
+
+        let order_by = if self.consume(TokenType::Order)? {
+            self.expect(TokenType::By)?;
+            self.parse_order_by_list()?
+        } else {
+            vec![]
+        };
+
+        let limit = if self.consume(TokenType::Limit)? {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let offset = if self.consume(TokenType::Offset)? {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        Ok(Statement::CompoundSelect(CompoundSelectStmt {
+            left,
+            parts,
+            order_by,
+            limit,
+            offset,
+        }))
+    }
+
+    fn parse_compound_operator(&mut self) -> Result<Option<CompoundOperator>> {
+        if self.consume(TokenType::Union)? {
+            let operator = if self.consume(TokenType::All)? {
+                CompoundOperator::UnionAll
+            } else {
+                CompoundOperator::Union
+            };
+            return Ok(Some(operator));
+        }
+
+        if self.consume(TokenType::Intersect)? {
+            if self.consume(TokenType::All)? {
+                return Err(Error::Parse("INTERSECT ALL is not currently supported".into()));
+            }
+            return Ok(Some(CompoundOperator::Intersect));
+        }
+
+        if self.consume(TokenType::Except)? {
+            if self.consume(TokenType::All)? {
+                return Err(Error::Parse("EXCEPT ALL is not currently supported".into()));
+            }
+            return Ok(Some(CompoundOperator::Except));
+        }
+
+        Ok(None)
+    }
+
+    fn parse_select_core(&mut self, parse_trailing_clauses: bool) -> Result<SelectStmt> {
+
         let distinct = self.consume(TokenType::Distinct)?;
         let _ = self.consume(TokenType::All);
 
@@ -88,36 +159,46 @@ impl<'a> Parser<'a> {
             None
         };
 
-        let order_by = if self.consume(TokenType::Order)? {
-            self.expect(TokenType::By)?;
-            self.parse_order_by_list()?
-        } else {
-            vec![]
-        };
-
-        let limit = if self.consume(TokenType::Limit)? {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        let offset = if self.consume(TokenType::Offset)? {
-            Some(self.parse_expr()?)
-        } else {
-            None
-        };
-
-        Ok(Statement::Select(SelectStmt {
+        let select = SelectStmt {
             distinct,
             columns,
             from,
             where_clause,
             group_by,
             having,
-            order_by,
-            limit,
-            offset,
-        }))
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
+
+        if parse_trailing_clauses {
+            self.parse_select_tail(select)
+        } else {
+            Ok(select)
+        }
+    }
+
+    fn parse_select_tail(&mut self, mut select: SelectStmt) -> Result<SelectStmt> {
+        select.order_by = if self.consume(TokenType::Order)? {
+            self.expect(TokenType::By)?;
+            self.parse_order_by_list()?
+        } else {
+            vec![]
+        };
+
+        select.limit = if self.consume(TokenType::Limit)? {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        select.offset = if self.consume(TokenType::Offset)? {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        Ok(select)
     }
 
     /// Parse result columns
@@ -135,6 +216,29 @@ impl<'a> Parser<'a> {
     fn parse_result_column(&mut self) -> Result<ResultColumn> {
         if self.consume(TokenType::Star)? {
             return Ok(ResultColumn::Star);
+        }
+
+        if matches!(self.current.ty, TokenType::Identifier | TokenType::QuotedIdentifier)
+            && self.peek.ty == TokenType::Dot
+        {
+            let qualifier = self.parse_identifier()?;
+            self.expect(TokenType::Dot)?;
+
+            if self.consume(TokenType::Star)? {
+                return Ok(ResultColumn::TableStar(qualifier));
+            }
+
+            let column = self.parse_identifier()?;
+            let expr = Expr::QualifiedIdentifier(qualifier, column);
+            let alias = if self.consume(TokenType::As)? {
+                Some(self.parse_identifier()?)
+            } else if matches!(self.current.ty, TokenType::Identifier | TokenType::QuotedIdentifier) {
+                Some(self.parse_identifier()?)
+            } else {
+                None
+            };
+
+            return Ok(ResultColumn::Expr(expr, alias));
         }
 
         let expr = self.parse_expr()?;
@@ -160,12 +264,70 @@ impl<'a> Parser<'a> {
     /// Parse FROM clause
     fn parse_from_clause(&mut self) -> Result<FromClause> {
         let mut tables = vec![self.parse_table_ref()?];
+        let mut joins = Vec::new();
 
-        while self.consume(TokenType::Comma)? {
+        loop {
+            if self.consume(TokenType::Comma)? {
+                tables.push(self.parse_table_ref()?);
+                joins.push(JoinClause {
+                    kind: JoinKind::Cross,
+                    constraint: None,
+                });
+                continue;
+            }
+
+            let join_kind = if self.consume(TokenType::Join)? {
+                Some(JoinKind::Inner)
+            } else if self.consume(TokenType::Inner)? {
+                self.expect(TokenType::Join)?;
+                Some(JoinKind::Inner)
+            } else if self.consume(TokenType::Cross)? {
+                self.expect(TokenType::Join)?;
+                Some(JoinKind::Cross)
+            } else if self.consume(TokenType::Left)? {
+                let _ = self.consume(TokenType::Outer)?;
+                self.expect(TokenType::Join)?;
+                Some(JoinKind::Left)
+            } else if matches!(self.current.ty, TokenType::Right | TokenType::Full | TokenType::Outer | TokenType::Natural) {
+                return Err(Error::Parse(
+                    "Only JOIN, INNER JOIN, LEFT JOIN, and CROSS JOIN are currently supported".into(),
+                ));
+            } else {
+                None
+            };
+
+            let Some(join_kind) = join_kind else {
+                break;
+            };
+
             tables.push(self.parse_table_ref()?);
+            let constraint = match join_kind {
+                JoinKind::Cross => {
+                    if matches!(self.current.ty, TokenType::On | TokenType::Using) {
+                        return Err(Error::Parse(
+                            "CROSS JOIN does not accept ON or USING in the current implementation".into(),
+                        ));
+                    }
+                    None
+                }
+                JoinKind::Inner | JoinKind::Left => {
+                    if self.consume(TokenType::On)? {
+                        Some(JoinConstraint::On(self.parse_expr()?))
+                    } else if self.consume(TokenType::Using)? {
+                        self.expect(TokenType::LeftParen)?;
+                        let columns = self.parse_identifier_list()?;
+                        self.expect(TokenType::RightParen)?;
+                        Some(JoinConstraint::Using(columns))
+                    } else {
+                        return Err(Error::Parse("Expected ON or USING after JOIN target".into()));
+                    }
+                }
+            };
+
+            joins.push(JoinClause { kind: join_kind, constraint });
         }
 
-        Ok(FromClause { tables })
+        Ok(FromClause { tables, joins })
     }
 
     /// Parse table reference
@@ -255,21 +417,123 @@ impl<'a> Parser<'a> {
 
     /// Parse comparison expression
     fn parse_comparison_expr(&mut self) -> Result<Expr> {
-        let left = self.parse_additive_expr()?;
+        let mut expr = self.parse_additive_expr()?;
 
-        let op = match self.current.ty {
-            TokenType::Equal => BinaryOp::Equal,
-            TokenType::NotEqual => BinaryOp::NotEqual,
-            TokenType::Less => BinaryOp::Less,
-            TokenType::LessEqual => BinaryOp::LessEqual,
-            TokenType::Greater => BinaryOp::Greater,
-            TokenType::GreaterEqual => BinaryOp::GreaterEqual,
-            _ => return Ok(left),
-        };
+        loop {
+            if self.consume(TokenType::IsNull)? {
+                expr = Expr::IsNull {
+                    expr: Box::new(expr),
+                    not: false,
+                };
+                continue;
+            }
 
-        self.advance();
-        let right = self.parse_additive_expr()?;
-        Ok(Expr::Binary(op, Box::new(left), Box::new(right)))
+            if self.consume(TokenType::NotNull)? {
+                expr = Expr::IsNull {
+                    expr: Box::new(expr),
+                    not: true,
+                };
+                continue;
+            }
+
+            if self.consume(TokenType::Is)? {
+                let not = self.consume(TokenType::Not)?;
+
+                if self.consume(TokenType::Null)? || self.consume(TokenType::IsNull)? {
+                    expr = Expr::IsNull {
+                        expr: Box::new(expr),
+                        not,
+                    };
+                    continue;
+                }
+
+                if self.consume(TokenType::NotNull)? {
+                    expr = Expr::IsNull {
+                        expr: Box::new(expr),
+                        not: !not,
+                    };
+                    continue;
+                }
+
+                let right = self.parse_additive_expr()?;
+                expr = Expr::Binary(
+                    if not {
+                        BinaryOp::NotEqual
+                    } else {
+                        BinaryOp::Equal
+                    },
+                    Box::new(expr),
+                    Box::new(right),
+                );
+                continue;
+            }
+
+            let not = if self.current.ty == TokenType::Not
+                && matches!(self.peek.ty, TokenType::In | TokenType::Between | TokenType::Like | TokenType::Glob)
+            {
+                self.advance();
+                true
+            } else {
+                false
+            };
+
+            if self.consume(TokenType::In)? {
+                self.expect(TokenType::LeftParen)?;
+                let source = if self.current.ty == TokenType::Select {
+                    InSource::Subquery(Box::new(self.parse_select()?))
+                } else if self.current.ty == TokenType::RightParen {
+                    InSource::List(Vec::new())
+                } else {
+                    InSource::List(self.parse_expr_list()?)
+                };
+                self.expect(TokenType::RightParen)?;
+                expr = Expr::In {
+                    expr: Box::new(expr),
+                    not,
+                    source,
+                };
+                continue;
+            }
+
+            if self.consume(TokenType::Between)? {
+                let low = self.parse_additive_expr()?;
+                self.expect(TokenType::And)?;
+                let high = self.parse_additive_expr()?;
+                expr = Expr::Between {
+                    expr: Box::new(expr),
+                    not,
+                    low: Box::new(low),
+                    high: Box::new(high),
+                };
+                continue;
+            }
+
+            if self.consume(TokenType::Like)? || self.consume(TokenType::Glob)? {
+                let pattern = self.parse_additive_expr()?;
+                expr = Expr::Like {
+                    expr: Box::new(expr),
+                    not,
+                    pattern: Box::new(pattern),
+                };
+                continue;
+            }
+
+            let op = match self.current.ty {
+                TokenType::Equal => BinaryOp::Equal,
+                TokenType::NotEqual => BinaryOp::NotEqual,
+                TokenType::Less => BinaryOp::Less,
+                TokenType::LessEqual => BinaryOp::LessEqual,
+                TokenType::Greater => BinaryOp::Greater,
+                TokenType::GreaterEqual => BinaryOp::GreaterEqual,
+                _ => break,
+            };
+
+            self.advance();
+            let right = self.parse_additive_expr()?;
+            expr = Expr::Binary(op, Box::new(expr), Box::new(right));
+        }
+
+        Ok(expr)
     }
 
     /// Parse additive expression
@@ -359,6 +623,13 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(Expr::Bool(false))
             }
+            TokenType::Exists => {
+                self.advance();
+                self.expect(TokenType::LeftParen)?;
+                let statement = self.parse_select()?;
+                self.expect(TokenType::RightParen)?;
+                Ok(Expr::Exists(Box::new(statement)))
+            }
             TokenType::Identifier | TokenType::QuotedIdentifier => {
                 let name = self.parse_identifier()?;
 
@@ -375,6 +646,13 @@ impl<'a> Parser<'a> {
             }
             TokenType::LeftParen => {
                 self.advance();
+
+                if self.current.ty == TokenType::Select {
+                    let statement = self.parse_select()?;
+                    self.expect(TokenType::RightParen)?;
+                    return Ok(Expr::Subquery(Box::new(statement)));
+                }
+
                 let expr = self.parse_expr()?;
                 self.expect(TokenType::RightParen)?;
                 Ok(Expr::Parenthesized(Box::new(expr)))
@@ -590,7 +868,8 @@ impl<'a> Parser<'a> {
                 TokenType::Primary => {
                     self.advance();
                     self.expect(TokenType::Key)?;
-                    constraints.push(ColumnConstraint::PrimaryKey { auto_increment: false });
+                    let auto_increment = self.consume(TokenType::AutoIncrement)?;
+                    constraints.push(ColumnConstraint::PrimaryKey { auto_increment });
                 }
                 TokenType::Not => {
                     self.advance();
@@ -600,6 +879,10 @@ impl<'a> Parser<'a> {
                 TokenType::Unique => {
                     self.advance();
                     constraints.push(ColumnConstraint::Unique);
+                }
+                TokenType::Default => {
+                    self.advance();
+                    constraints.push(ColumnConstraint::Default(self.parse_expr()?));
                 }
                 _ => break,
             }
@@ -894,7 +1177,18 @@ impl<'a> Parser<'a> {
 /// Parse SQL text into a statement
 pub fn parse_sql(sql: &str) -> Result<Statement> {
     let mut parser = Parser::new(sql)?;
-    parser.parse()
+    let statement = parser.parse()?;
+
+    while parser.consume(TokenType::Semicolon)? {}
+
+    if parser.current.ty != TokenType::Eof {
+        return Err(Error::Parse(format!(
+            "Unexpected trailing token: {}",
+            parser.current.value
+        )));
+    }
+
+    Ok(statement)
 }
 
 #[cfg(test)]
@@ -929,5 +1223,240 @@ mod tests {
     fn test_parse_commit() {
         let stmt = parse_sql("COMMIT").unwrap();
         assert!(matches!(stmt, Statement::Commit));
+    }
+
+    #[test]
+    fn test_parse_select_with_filters_and_paging() {
+        let stmt = parse_sql(
+            "SELECT DISTINCT id, name FROM users WHERE score BETWEEN 1.5 AND 9.5 AND name LIKE 'A%' AND id IN (1, 2, 3) AND note IS NOT NULL ORDER BY id DESC LIMIT 5 OFFSET 10"
+        )
+        .unwrap();
+
+        let Statement::Select(select) = stmt else {
+            panic!("expected select statement");
+        };
+
+        assert!(select.distinct);
+        assert_eq!(select.order_by.len(), 1);
+        assert!(select.limit.is_some());
+        assert!(select.offset.is_some());
+        assert!(select.where_clause.is_some());
+    }
+
+    #[test]
+    fn test_parse_select_with_table_star_and_qualified_column() {
+        let stmt = parse_sql("SELECT users.*, orders.amount FROM users, orders").unwrap();
+
+        let Statement::Select(select) = stmt else {
+            panic!("expected select statement");
+        };
+
+        assert_eq!(select.columns.len(), 2);
+        assert!(matches!(select.columns[0], ResultColumn::TableStar(ref name) if name == "users"));
+        assert!(matches!(
+            select.columns[1],
+            ResultColumn::Expr(Expr::QualifiedIdentifier(ref table, ref column), None)
+                if table == "orders" && column == "amount"
+        ));
+    }
+
+    #[test]
+    fn test_parse_select_with_join_on_and_cross_join() {
+        let join_stmt = parse_sql(
+            "SELECT u.name, o.amount FROM users AS u JOIN orders AS o ON u.id = o.user_id WHERE o.amount > 10"
+        )
+        .unwrap();
+
+        let Statement::Select(join_select) = join_stmt else {
+            panic!("expected select statement");
+        };
+
+        assert_eq!(join_select.from.as_ref().unwrap().tables.len(), 2);
+    assert_eq!(join_select.from.as_ref().unwrap().joins.len(), 1);
+        assert_eq!(join_select.from.as_ref().unwrap().tables[0].alias.as_deref(), Some("u"));
+        assert_eq!(join_select.from.as_ref().unwrap().tables[1].alias.as_deref(), Some("o"));
+        assert!(join_select.where_clause.is_some());
+
+        let cross_stmt = parse_sql("SELECT COUNT(*) FROM users CROSS JOIN orders").unwrap();
+        let Statement::Select(cross_select) = cross_stmt else {
+            panic!("expected select statement");
+        };
+
+        assert_eq!(cross_select.from.as_ref().unwrap().tables.len(), 2);
+        assert!(matches!(
+            cross_select.from.as_ref().unwrap().joins[0].kind,
+            JoinKind::Cross
+        ));
+        assert!(cross_select.where_clause.is_none());
+    }
+
+    #[test]
+    fn test_parse_select_with_left_join_and_using() {
+        let stmt = parse_sql(
+            "SELECT u.id, p.nickname FROM users AS u LEFT OUTER JOIN profiles AS p USING (id)"
+        )
+        .unwrap();
+
+        let Statement::Select(select) = stmt else {
+            panic!("expected select statement");
+        };
+
+        let from = select.from.as_ref().unwrap();
+        assert_eq!(from.tables.len(), 2);
+        assert_eq!(from.joins.len(), 1);
+        assert!(matches!(from.joins[0].kind, JoinKind::Left));
+        assert!(matches!(
+            from.joins[0].constraint,
+            Some(JoinConstraint::Using(ref columns)) if columns == &vec!["id".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_parse_union_all_select() {
+        let stmt = parse_sql("SELECT 1 AS value UNION ALL SELECT 2 AS value UNION SELECT 2 AS value").unwrap();
+
+        let Statement::CompoundSelect(compound) = stmt else {
+            panic!("expected compound select statement");
+        };
+
+        assert_eq!(compound.parts.len(), 2);
+        assert!(matches!(compound.parts[0].operator, CompoundOperator::UnionAll));
+        assert!(matches!(compound.parts[1].operator, CompoundOperator::Union));
+    }
+
+    #[test]
+    fn test_parse_intersect_and_except_select() {
+        let stmt = parse_sql("SELECT 1 AS value INTERSECT SELECT 1 AS value EXCEPT SELECT 2 AS value").unwrap();
+
+        let Statement::CompoundSelect(compound) = stmt else {
+            panic!("expected compound select statement");
+        };
+
+        assert_eq!(compound.parts.len(), 2);
+        assert!(matches!(compound.parts[0].operator, CompoundOperator::Intersect));
+        assert!(matches!(compound.parts[1].operator, CompoundOperator::Except));
+    }
+
+    #[test]
+    fn test_parse_compound_select_with_outer_order_limit_offset() {
+        let stmt = parse_sql(
+            "SELECT 1 AS value UNION ALL SELECT 2 AS value ORDER BY value DESC LIMIT 1 OFFSET 0"
+        )
+        .unwrap();
+
+        let Statement::CompoundSelect(compound) = stmt else {
+            panic!("expected compound select statement");
+        };
+
+        assert_eq!(compound.parts.len(), 1);
+        assert_eq!(compound.order_by.len(), 1);
+        assert!(compound.limit.is_some());
+        assert!(compound.offset.is_some());
+        assert!(compound.left.order_by.is_empty());
+        assert!(compound.parts[0].select.order_by.is_empty());
+    }
+
+    #[test]
+    fn test_parse_in_subquery() {
+        let stmt = parse_sql(
+            "SELECT id FROM users WHERE id IN (SELECT id FROM users WHERE team = 'red')"
+        )
+        .unwrap();
+
+        let Statement::Select(select) = stmt else {
+            panic!("expected select statement");
+        };
+
+        assert!(matches!(
+            select.where_clause,
+            Some(Expr::In {
+                source: InSource::Subquery(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_parse_exists_subquery() {
+        let stmt = parse_sql(
+            "SELECT id FROM users WHERE EXISTS (SELECT id FROM users WHERE team = 'red')"
+        )
+        .unwrap();
+
+        let Statement::Select(select) = stmt else {
+            panic!("expected select statement");
+        };
+
+        assert!(matches!(
+            select.where_clause,
+            Some(Expr::Exists(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_scalar_subquery() {
+        let stmt = parse_sql(
+            "SELECT id FROM users WHERE id = (SELECT id FROM users WHERE team = 'red')"
+        )
+        .unwrap();
+
+        let Statement::Select(select) = stmt else {
+            panic!("expected select statement");
+        };
+
+        assert!(matches!(
+            select.where_clause,
+            Some(Expr::Binary(BinaryOp::Equal, _, right)) if matches!(*right, Expr::Subquery(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_alter_table_rename_to() {
+        let stmt = parse_sql("ALTER TABLE users RENAME TO members").unwrap();
+
+        let Statement::AlterTable(alter) = stmt else {
+            panic!("expected alter table statement");
+        };
+
+        assert_eq!(alter.table, "users");
+        assert!(matches!(alter.action, AlterAction::RenameTo(ref name) if name == "members"));
+    }
+
+    #[test]
+    fn test_parse_alter_table_rename_column() {
+        let stmt = parse_sql("ALTER TABLE users RENAME COLUMN name TO display_name").unwrap();
+
+        let Statement::AlterTable(alter) = stmt else {
+            panic!("expected alter table statement");
+        };
+
+        assert!(matches!(
+            alter.action,
+            AlterAction::RenameColumn { ref old, ref new }
+                if old == "name" && new == "display_name"
+        ));
+    }
+
+    #[test]
+    fn test_parse_alter_table_add_column() {
+        let stmt = parse_sql("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'").unwrap();
+
+        let Statement::AlterTable(alter) = stmt else {
+            panic!("expected alter table statement");
+        };
+
+        assert!(matches!(alter.action, AlterAction::AddColumn(ref col) if col.name == "status"));
+    }
+
+    #[test]
+    fn test_parse_sql_allows_trailing_semicolon() {
+        let stmt = parse_sql("SELECT 1 AS value;").unwrap();
+        assert!(matches!(stmt, Statement::Select(_)));
+    }
+
+    #[test]
+    fn test_parse_sql_rejects_trailing_tokens() {
+        let err = parse_sql("SELECT 1 value extra").unwrap_err();
+        assert!(err.to_string().contains("Unexpected trailing token: extra"));
     }
 }

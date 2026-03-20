@@ -10,6 +10,8 @@ use std::fmt;
 pub enum Statement {
     /// SELECT statement
     Select(SelectStmt),
+    /// Compound SELECT statement
+    CompoundSelect(CompoundSelectStmt),
     /// INSERT statement
     Insert(InsertStmt),
     /// UPDATE statement
@@ -71,6 +73,52 @@ pub struct SelectStmt {
     pub offset: Option<Expr>,
 }
 
+/// Compound SELECT statement
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundSelectStmt {
+    /// Left-most select
+    pub left: SelectStmt,
+    /// Remaining compound parts
+    pub parts: Vec<CompoundSelectPart>,
+    /// ORDER BY clause applied after compound evaluation
+    pub order_by: Vec<OrderByItem>,
+    /// LIMIT clause applied after compound evaluation
+    pub limit: Option<Expr>,
+    /// OFFSET clause applied after compound evaluation
+    pub offset: Option<Expr>,
+}
+
+/// IN expression right-hand side
+#[derive(Debug, Clone, PartialEq)]
+pub enum InSource {
+    /// Explicit expression list
+    List(Vec<Expr>),
+    /// SELECT subquery
+    Subquery(Box<Statement>),
+}
+
+/// One compound SELECT segment
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundSelectPart {
+    /// Compound operator
+    pub operator: CompoundOperator,
+    /// Right-hand select
+    pub select: SelectStmt,
+}
+
+/// Supported compound operators
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompoundOperator {
+    /// UNION DISTINCT
+    Union,
+    /// UNION ALL
+    UnionAll,
+    /// INTERSECT DISTINCT
+    Intersect,
+    /// EXCEPT DISTINCT
+    Except,
+}
+
 /// Result column in SELECT
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResultColumn {
@@ -87,6 +135,37 @@ pub enum ResultColumn {
 pub struct FromClause {
     /// Table references
     pub tables: Vec<TableRef>,
+    /// Join operators between adjacent table references
+    pub joins: Vec<JoinClause>,
+}
+
+/// Join operator between adjacent table references
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinClause {
+    /// Join kind
+    pub kind: JoinKind,
+    /// Join constraint
+    pub constraint: Option<JoinConstraint>,
+}
+
+/// Supported join kinds
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// Comma join or CROSS JOIN
+    Cross,
+    /// JOIN or INNER JOIN
+    Inner,
+    /// LEFT JOIN or LEFT OUTER JOIN
+    Left,
+}
+
+/// Supported join constraints
+#[derive(Debug, Clone, PartialEq)]
+pub enum JoinConstraint {
+    /// ON predicate
+    On(Expr),
+    /// USING column list
+    Using(Vec<String>),
 }
 
 /// Table reference
@@ -129,11 +208,15 @@ pub enum Expr {
     Function(String, Vec<Expr>),
     /// Parenthesized expression
     Parenthesized(Box<Expr>),
+    /// Scalar subquery
+    Subquery(Box<Statement>),
+    /// EXISTS subquery
+    Exists(Box<Statement>),
     /// IN expression
     In {
         expr: Box<Expr>,
         not: bool,
-        list: Vec<Expr>,
+        source: InSource,
     },
     /// BETWEEN expression
     Between {
@@ -406,6 +489,7 @@ impl fmt::Display for Statement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Statement::Select(_) => write!(f, "SELECT ..."),
+            Statement::CompoundSelect(_) => write!(f, "SELECT ... UNION ..."),
             Statement::Insert(i) => write!(f, "INSERT INTO {} ...", i.table),
             Statement::Update(u) => write!(f, "UPDATE {} ...", u.table),
             Statement::Delete(d) => write!(f, "DELETE FROM {} ...", d.table),

@@ -265,7 +265,7 @@ fn run_batch_statement(database: &RefCell<Connection>, sql: &str) -> ApiResult<S
     let ast = parse_sql(sql).map_err(error_message)?;
 
     match ast {
-        SqlAstStatement::Select(_) => Ok(StatementExecution {
+        SqlAstStatement::Select(_) | SqlAstStatement::CompoundSelect(_) => Ok(StatementExecution {
             changed_schema_or_data: false,
             query_result: Some(run_query(database, sql)?),
         }),
@@ -298,6 +298,7 @@ fn run_batch_statement(database: &RefCell<Connection>, sql: &str) -> ApiResult<S
             })
         }
         SqlAstStatement::CreateTable(_)
+        | SqlAstStatement::AlterTable(_)
         | SqlAstStatement::Insert(_)
         | SqlAstStatement::Update(_)
         | SqlAstStatement::Delete(_)
@@ -315,18 +316,19 @@ fn run_batch_statement(database: &RefCell<Connection>, sql: &str) -> ApiResult<S
 
 fn ensure_query_statement(sql: &str) -> ApiResult<()> {
     match parse_sql(sql).map_err(error_message)? {
-        SqlAstStatement::Select(_) => Ok(()),
+        SqlAstStatement::Select(_) | SqlAstStatement::CompoundSelect(_) => Ok(()),
         _ => Err("`query` only supports SELECT statements".to_string()),
     }
 }
 
 fn ensure_execute_statement(sql: &str) -> ApiResult<()> {
     match parse_sql(sql).map_err(error_message)? {
-        SqlAstStatement::Select(_) => Err("`execute` does not support SELECT statements, use `query` instead".to_string()),
+        SqlAstStatement::Select(_) | SqlAstStatement::CompoundSelect(_) => Err("`execute` does not support SELECT statements, use `query` instead".to_string()),
         SqlAstStatement::Begin(_)
         | SqlAstStatement::Commit
         | SqlAstStatement::Rollback(_)
         | SqlAstStatement::CreateTable(_)
+        | SqlAstStatement::AlterTable(_)
         | SqlAstStatement::Insert(_)
         | SqlAstStatement::Update(_)
         | SqlAstStatement::Delete(_)

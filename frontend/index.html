@@ -63,7 +63,7 @@
       }
 
       .app-shell {
-        width: min(1280px, 100%);
+        width: min(1680px, 100%);
         margin: 0 auto;
         display: grid;
         grid-template-columns: 320px minmax(0, 1fr);
@@ -190,6 +190,7 @@
         padding: 24px;
         display: grid;
         gap: 20px;
+        min-width: 0;
       }
 
       .card {
@@ -197,6 +198,7 @@
         border-radius: var(--radius-lg);
         background: var(--panel-strong);
         padding: 20px;
+        min-width: 0;
       }
 
       .status {
@@ -219,6 +221,14 @@
         align-items: center;
         gap: 12px;
         margin-bottom: 16px;
+        flex-wrap: wrap;
+      }
+
+      .toolbar-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
       }
 
       .sql-input {
@@ -327,14 +337,17 @@
       }
 
       .table-wrap {
-        overflow: auto;
+        max-width: 100%;
+        overflow-x: auto;
+        overflow-y: auto;
         border-radius: 18px;
         border: 1px solid var(--line);
         background: rgba(255, 255, 255, 0.88);
       }
 
       table {
-        width: 100%;
+        width: max-content;
+        min-width: 100%;
         border-collapse: collapse;
         min-width: 420px;
       }
@@ -345,6 +358,7 @@
         border-bottom: 1px solid var(--line);
         text-align: left;
         vertical-align: top;
+        white-space: nowrap;
       }
 
       th {
@@ -433,6 +447,10 @@
               </div>
               <div id="resultMeta" class="result-meta"></div>
             </div>
+            <div class="toolbar-actions">
+              <button id="exportSqlButton" class="action action-secondary" type="button">导出 .sql</button>
+              <button id="exportXlsxButton" class="action action-secondary" type="button">导出 .xlsx</button>
+            </div>
           </div>
           <div id="resultContainer" class="empty">点击左侧表名，或者在上方执行一条 SQL。</div>
           <div id="pagination" class="pagination" hidden>
@@ -458,6 +476,7 @@
 
     <script type="module">
       import { backend } from 'declarations/backend';
+      import { queryResultToSqlText, queryResultToXlsxBytes, normalizeExportName } from './exporter.js';
       import { readImportFile } from './importer.js';
 
       const state = {
@@ -487,7 +506,19 @@
         pageSizeSelect: document.querySelector('#pageSizeSelect'),
         prevPageButton: document.querySelector('#prevPageButton'),
         nextPageButton: document.querySelector('#nextPageButton'),
+        exportSqlButton: document.querySelector('#exportSqlButton'),
+        exportXlsxButton: document.querySelector('#exportXlsxButton'),
       };
+
+      function hasExportableResult() {
+        return state.currentColumns.length > 0;
+      }
+
+      function updateExportButtons() {
+        const disabled = state.loading || !hasExportableResult();
+        elements.exportSqlButton.disabled = disabled;
+        elements.exportXlsxButton.disabled = disabled;
+      }
 
       function setBusy(isBusy) {
         state.loading = isBusy;
@@ -498,6 +529,7 @@
         elements.pageSizeSelect.disabled = isBusy;
         elements.prevPageButton.disabled = isBusy;
         elements.nextPageButton.disabled = isBusy;
+        updateExportButtons();
       }
 
       function setStatus(message, kind = '') {
@@ -516,6 +548,50 @@
 
       function quoteIdentifier(name) {
         return `"${String(name).replaceAll('"', '""')}"`;
+      }
+
+      function triggerDownload(blob, fileName) {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = fileName;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+      }
+
+      function currentExportName() {
+        if (state.currentTitle.startsWith('表 ') && state.selectedTable) {
+          return normalizeExportName(state.selectedTable);
+        }
+
+        return normalizeExportName(state.currentTitle || 'query_result');
+      }
+
+      function exportCurrentResult(format) {
+        if (!hasExportableResult()) {
+          setStatus('当前没有可导出的结果。', 'error');
+          return;
+        }
+
+        const exportName = currentExportName();
+
+        if (format === 'sql') {
+          const sqlText = queryResultToSqlText(exportName, state.currentColumns, state.currentRows);
+          triggerDownload(new Blob([sqlText], { type: 'application/sql;charset=utf-8' }), `${exportName}.sql`);
+          setStatus(`已导出 SQL 文件：${exportName}.sql`, 'success');
+          return;
+        }
+
+        const xlsxBytes = queryResultToXlsxBytes(exportName, state.currentColumns, state.currentRows);
+        triggerDownload(
+          new Blob([xlsxBytes], {
+            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          }),
+          `${exportName}.xlsx`
+        );
+        setStatus(`已导出 Excel 文件：${exportName}.xlsx`, 'success');
       }
 
       function sqlValueToText(cell) {
@@ -717,6 +793,7 @@
         if (!hasColumns) {
           elements.pagination.hidden = true;
           elements.paginationInfo.textContent = '';
+          updateExportButtons();
           return;
         }
 
@@ -733,6 +810,7 @@
           : '当前结果没有数据行';
         elements.prevPageButton.disabled = state.loading || state.currentPage <= 1;
         elements.nextPageButton.disabled = state.loading || state.currentPage >= totalPages;
+        updateExportButtons();
       }
 
       function renderResult(title, columns = [], rows = [], options = {}) {
@@ -939,6 +1017,8 @@
           renderResult(state.currentTitle, state.currentColumns, state.currentRows, { resetPage: false });
         }
       });
+      elements.exportSqlButton.addEventListener('click', () => exportCurrentResult('sql'));
+      elements.exportXlsxButton.addEventListener('click', () => exportCurrentResult('xlsx'));
 
       async function init() {
         await refreshTables();
@@ -954,6 +1034,8 @@
         renderEmptyResult('页面初始化失败。');
         setStatus(`页面初始化失败：${error.message}`, 'error');
       });
+
+      updateExportButtons();
     </script>
   </body>
 </html>

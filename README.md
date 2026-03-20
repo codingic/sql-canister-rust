@@ -9,7 +9,14 @@
 后端能力：
 
 - 支持 `CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`、`DROP`
+- 支持基础 `ALTER TABLE ... RENAME TO`、`ALTER TABLE ... RENAME COLUMN`、`ALTER TABLE ... ADD COLUMN`
 - 支持 `SELECT` 查询并返回结构化结果
+- 支持 `DISTINCT`、`ORDER BY`、`LIMIT`、`OFFSET`
+- 支持基础 `IN (SELECT ...)`、`EXISTS (SELECT ...)`、`NOT EXISTS (SELECT ...)`，以及单值标量子查询表达式
+- 支持基础 `UNION`、`UNION ALL`、`INTERSECT`、`EXCEPT`，以及 compound query 最外层 `ORDER BY`、`LIMIT`、`OFFSET`
+- 支持 `GROUP BY`、`HAVING`、`COUNT/SUM/AVG/MIN/MAX`
+- 支持多表 `FROM table_a, table_b` 查询、表别名、限定列名和 `table.*`
+- 支持显式 `JOIN ... ON`、`INNER JOIN ... ON`、`LEFT JOIN`、`LEFT OUTER JOIN`、`JOIN ... USING (...)`、`CROSS JOIN` 的基础连接语义
 - 支持 `BEGIN`、`COMMIT`、`ROLLBACK` 基础事务
 - 支持 `execute_batch` 一次执行多条 SQL，减少大 `.sql` 文件导入时的 canister 往返次数
 - 支持 canister 升级后的数据持久化恢复
@@ -23,6 +30,7 @@
 - 支持手动输入 SQL 执行
 - 支持选择 `.sql` 文件并按顺序拆分 SQL 语句后批量执行
 - 支持选择 `.xlsx` 文件并自动转换成建表加导入 SQL
+- 支持把当前查询结果导出成 `.sql` 或 `.xlsx`
 - `.xlsx` 导入会按批量 `INSERT` 生成 SQL，并自动包裹事务，避免逐行导入过慢
 
 测试覆盖：
@@ -30,12 +38,18 @@
 - 三张表建表和写入校验
 - 每张表 10 列的宽表校验
 - 三张主表每张表插入 100 行数据校验
+- 约束校验：`NOT NULL`、`PRIMARY KEY`、`UNIQUE`、`DEFAULT`
+- 表结构变更校验：`ALTER TABLE` 重命名表、重命名列、追加带默认值的新列
+- 查询语义校验：过滤、分页、聚合、分组、多表查询、显式 `JOIN`
+- compound query 校验：`UNION`、`UNION ALL`、`INTERSECT`、`EXCEPT` 以及外层排序分页
+- 基础子查询校验：`IN (SELECT ...)`、`EXISTS`、`NOT EXISTS`、标量子查询
 - 中文表、中文列、中文内容严格兼容校验
 - 单表插入 100 条中文数据校验
 - 升级后中文数据和普通数据保持不丢失
 - 事务提交和回滚校验
 - 非法语句和不支持语句的报错校验
 - `.xlsx` 导入转换 SQL 校验
+- 查询结果导出 `.sql` / `.xlsx` 转换校验
 - 批量执行接口对混合语句、事务和最后一次查询结果的校验
 
 ## Canister 接口
@@ -124,11 +138,32 @@ dfx canister call backend info --output json
 npm run test:canister
 ```
 
+按功能全名运行指定 canister 测试：
+
+```bash
+node tests/backend.canister.test.js --list
+node tests/backend.canister.test.js testConstraintEnforcement
+node tests/backend.canister.test.js testAdvancedSelectFeatures testGroupedSelectFeatures testMultiTableSelectFeatures
+```
+
 运行文件导入转换测试：
 
 ```bash
 npm run test:file-import
 ```
+
+测试目录结构：
+
+- [tests/backend.canister.test.js](tests/backend.canister.test.js)：canister 集成测试入口，支持 `--list` 和按功能全名筛选
+- [tests/canister/harness.js](tests/canister/harness.js)：dfx 调用、SQL 辅助函数、测试筛选与公共断言
+- [tests/canister/cases/basic.js](tests/canister/cases/basic.js)：基础 CRUD 与类型化结果校验
+- [tests/canister/cases/sql-features.js](tests/canister/cases/sql-features.js)：SQL 功能测试聚合入口
+- [tests/canister/cases/schema-features.js](tests/canister/cases/schema-features.js)：约束与 `ALTER TABLE` 测试
+- [tests/canister/cases/select-features.js](tests/canister/cases/select-features.js)：过滤、排序、分页、聚合、分组测试
+- [tests/canister/cases/subquery-features.js](tests/canister/cases/subquery-features.js)：基础子查询测试
+- [tests/canister/cases/compound-features.js](tests/canister/cases/compound-features.js)：compound query 与错误处理测试
+- [tests/canister/cases/join-features.js](tests/canister/cases/join-features.js)：多表查询与连接测试
+- [tests/canister/cases/lifecycle.js](tests/canister/cases/lifecycle.js)：事务、升级持久化、错误透出与中文兼容测试
 
 这套 canister 测试会自动：
 
@@ -142,9 +177,12 @@ npm run test:file-import
 - 生成一个测试用 `.xlsx` 工作簿
 - 验证工作表会被转换成 `BEGIN`、`CREATE TABLE`、批量 `INSERT`、`COMMIT` SQL
 - 验证中文表名、中文列名和数值类型推断
+- 验证查询结果可以导出成 `.sql` 和 `.xlsx`
 
 ## 限制说明
 
 - 当前实现更适合单表 CRUD、基础查询和验证性场景，不是完整 SQLite 兼容实现
+- 当前只支持基础非相关子查询；暂不支持相关子查询和 `FROM (SELECT ...)` 形式的子查询
+- 当前只支持 `JOIN`、`INNER JOIN`、`LEFT JOIN`、`LEFT OUTER JOIN`、`CROSS JOIN`；暂不支持 `RIGHT JOIN`、`FULL JOIN`、`NATURAL JOIN`
 - 前端已支持 `.sql` 文件选择执行，但“拖拽上传 / 独立文件执行进度 / 失败定位”还未落地
 - `.xlsx` 当前支持导入首行表头加数据区，并转换为单工作表或多工作表 SQL；还没有做复杂格式、公式结果校验和大文件分片上传

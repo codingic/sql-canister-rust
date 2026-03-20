@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { read, utils, write } from 'xlsx';
+import { queryResultToSqlText, queryResultToXlsxBytes } from '../frontend/exporter.js';
 import { workbookToSqlText } from '../frontend/importer.js';
 
 function runCase(name, fn) {
@@ -34,4 +35,48 @@ runCase('xlsx workbook converts to sql text', () => {
   assert.match(sqlText, /'李四'/);
   assert.match(sqlText, /88\.5/);
   assert.match(sqlText, /COMMIT;$/);
+});
+
+runCase('query result exports to sql text', () => {
+  const sqlText = queryResultToSqlText(
+    '供应商数据',
+    ['编号', '姓名', '积分', '备注'],
+    [
+      [{ Integer: 1 }, { Text: '张三' }, { Float: 88.5 }, { Null: null }],
+      [{ Integer: 2 }, { Text: '李四' }, { Integer: 91 }, { Text: 'VIP' }],
+    ]
+  );
+
+  assert.match(sqlText, /^BEGIN;/);
+  assert.match(sqlText, /CREATE TABLE "供应商数据"/);
+  assert.match(sqlText, /"编号" INTEGER/);
+  assert.match(sqlText, /"姓名" TEXT/);
+  assert.match(sqlText, /"积分" REAL/);
+  assert.match(sqlText, /"备注" TEXT/);
+  assert.match(sqlText, /INSERT INTO "供应商数据"/);
+  assert.match(sqlText, /VALUES \(1, '张三', 88\.5, NULL\), \(2, '李四', 91, 'VIP'\)/);
+  assert.match(sqlText, /COMMIT;$/);
+});
+
+runCase('query result exports to xlsx bytes', () => {
+  const xlsxBytes = queryResultToXlsxBytes(
+    '供应商数据',
+    ['编号', '姓名', '积分', '备注'],
+    [
+      [{ Integer: 1 }, { Text: '张三' }, { Float: 88.5 }, { Null: null }],
+      [{ Integer: 2 }, { Text: '李四' }, { Integer: 91 }, { Text: 'VIP' }],
+    ]
+  );
+  const workbook = read(Buffer.from(xlsxBytes), { type: 'buffer' });
+  const rows = utils.sheet_to_json(workbook.Sheets['供应商数据'], {
+    header: 1,
+    raw: true,
+    defval: null,
+  });
+
+  assert.deepEqual(rows, [
+    ['编号', '姓名', '积分', '备注'],
+    [1, '张三', 88.5, null],
+    [2, '李四', 91, 'VIP'],
+  ]);
 });
