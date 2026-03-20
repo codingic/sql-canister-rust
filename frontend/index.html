@@ -1,0 +1,959 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SQL Canister</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg-top: #f7efe2;
+        --bg-bottom: #d9e8f5;
+        --panel: rgba(255, 251, 245, 0.82);
+        --panel-strong: rgba(255, 255, 255, 0.94);
+        --line: rgba(27, 47, 73, 0.12);
+        --line-strong: rgba(27, 47, 73, 0.2);
+        --text: #142033;
+        --muted: #5e6c7c;
+        --accent: #0f7b6c;
+        --accent-strong: #0b5d52;
+        --accent-soft: rgba(15, 123, 108, 0.1);
+        --warning: #8a5a00;
+        --shadow: 0 24px 80px rgba(20, 32, 51, 0.12);
+        --radius-xl: 28px;
+        --radius-lg: 20px;
+        --radius-md: 14px;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        padding: 28px;
+        box-sizing: border-box;
+        font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", sans-serif;
+        background:
+          radial-gradient(circle at top left, rgba(255, 255, 255, 0.88), transparent 32%),
+          linear-gradient(145deg, var(--bg-top), var(--bg-bottom));
+        color: var(--text);
+      }
+
+      body::before,
+      body::after {
+        content: "";
+        position: fixed;
+        inset: auto;
+        width: 320px;
+        height: 320px;
+        border-radius: 999px;
+        filter: blur(18px);
+        opacity: 0.3;
+        pointer-events: none;
+      }
+
+      body::before {
+        top: -90px;
+        right: -50px;
+        background: #ffd16f;
+      }
+
+      body::after {
+        bottom: -120px;
+        left: -40px;
+        background: #8ecfd0;
+      }
+
+      .app-shell {
+        width: min(1280px, 100%);
+        margin: 0 auto;
+        display: grid;
+        grid-template-columns: 320px minmax(0, 1fr);
+        gap: 24px;
+      }
+
+      .panel {
+        position: relative;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: var(--radius-xl);
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(20px);
+      }
+
+      .panel::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background: linear-gradient(180deg, rgba(255, 255, 255, 0.28), transparent 24%);
+        pointer-events: none;
+      }
+
+      .sidebar {
+        padding: 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 20px;
+      }
+
+      .hero {
+        padding: 4px 0 6px;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.72);
+        color: var(--accent-strong);
+        font-size: 0.8rem;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: var(--accent);
+      }
+
+      h1 {
+        margin: 16px 0 10px;
+        font-size: clamp(2rem, 3.5vw, 3rem);
+        line-height: 1;
+      }
+
+      .subtitle {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.7;
+      }
+
+      .section-title {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .section-title h2,
+      .section-title h3 {
+        margin: 0;
+        font-size: 1rem;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        min-height: 30px;
+        padding: 0 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent-strong);
+        font-size: 0.84rem;
+      }
+
+      .table-list {
+        display: grid;
+        gap: 10px;
+      }
+
+      .table-button {
+        width: 100%;
+        padding: 14px 16px;
+        border: 1px solid transparent;
+        border-radius: var(--radius-md);
+        background: rgba(255, 255, 255, 0.74);
+        color: var(--text);
+        text-align: left;
+        font-size: 0.96rem;
+        cursor: pointer;
+        transition: transform 180ms ease, border-color 180ms ease, background 180ms ease;
+      }
+
+      .table-button:hover {
+        transform: translateY(-1px);
+        border-color: var(--line-strong);
+        background: rgba(255, 255, 255, 0.96);
+      }
+
+      .table-button.active {
+        border-color: rgba(15, 123, 108, 0.28);
+        background: linear-gradient(135deg, rgba(15, 123, 108, 0.12), rgba(255, 255, 255, 0.98));
+        box-shadow: inset 0 0 0 1px rgba(15, 123, 108, 0.08);
+      }
+
+      .content {
+        padding: 24px;
+        display: grid;
+        gap: 20px;
+      }
+
+      .card {
+        border: 1px solid var(--line);
+        border-radius: var(--radius-lg);
+        background: var(--panel-strong);
+        padding: 20px;
+      }
+
+      .status {
+        min-height: 24px;
+        color: var(--muted);
+        font-size: 0.96rem;
+      }
+
+      .status.error {
+        color: #9b1c1c;
+      }
+
+      .status.success {
+        color: var(--accent-strong);
+      }
+
+      .toolbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+
+      .sql-input {
+        width: 100%;
+        min-height: 140px;
+        resize: vertical;
+        padding: 16px;
+        border: 1px solid var(--line-strong);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.92);
+        color: var(--text);
+        font: 500 0.96rem/1.6 "SFMono-Regular", "JetBrains Mono", monospace;
+        box-sizing: border-box;
+      }
+
+      .sql-input:focus {
+        outline: 2px solid rgba(15, 123, 108, 0.18);
+        border-color: rgba(15, 123, 108, 0.3);
+      }
+
+      .actions {
+        display: flex;
+        gap: 12px;
+        margin-top: 14px;
+        flex-wrap: wrap;
+      }
+
+      .file-input {
+        max-width: 280px;
+        padding: 10px 12px;
+        border: 1px solid var(--line-strong);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.92);
+        color: var(--text);
+        font: inherit;
+      }
+
+      button.action {
+        padding: 12px 18px;
+        border: 0;
+        border-radius: 14px;
+        cursor: pointer;
+        font-weight: 600;
+        font-size: 0.96rem;
+        transition: transform 180ms ease, opacity 180ms ease, box-shadow 180ms ease;
+      }
+
+      button.action:hover {
+        transform: translateY(-1px);
+      }
+
+      button.action:disabled {
+        opacity: 0.55;
+        cursor: wait;
+        transform: none;
+      }
+
+      .action-primary {
+        background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+        color: #fff;
+        box-shadow: 0 12px 30px rgba(15, 123, 108, 0.22);
+      }
+
+      .action-secondary {
+        background: rgba(17, 24, 39, 0.06);
+        color: var(--text);
+      }
+
+      .result-meta {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      .pagination {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        margin-top: 14px;
+      }
+
+      .pagination-info {
+        color: var(--muted);
+        font-size: 0.92rem;
+      }
+
+      .pagination-actions {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .page-size {
+        padding: 10px 12px;
+        border: 1px solid var(--line-strong);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.92);
+        color: var(--text);
+        font: inherit;
+      }
+
+      .table-wrap {
+        overflow: auto;
+        border-radius: 18px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.88);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        min-width: 420px;
+      }
+
+      th,
+      td {
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--line);
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        background: rgba(20, 32, 51, 0.04);
+        font-size: 0.84rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+
+      tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .empty,
+      .hint {
+        padding: 18px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.64);
+        color: var(--muted);
+      }
+
+      .hint {
+        color: var(--warning);
+      }
+
+      @media (max-width: 980px) {
+        .app-shell {
+          grid-template-columns: 1fr;
+        }
+
+        body {
+          padding: 16px;
+        }
+
+        .sidebar,
+        .content {
+          padding: 18px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="panel sidebar">
+        <section class="hero">
+          <div class="eyebrow">Canister Browser</div>
+          <h1>SQL Canister</h1>
+          <p class="subtitle">页面加载后会自动读取数据库表列表。点击任意一张表，会立刻查询并展示当前表数据。</p>
+        </section>
+
+        <section>
+          <div class="section-title">
+            <h2>数据表</h2>
+            <button id="refreshTablesButton" class="action action-secondary" type="button">刷新</button>
+          </div>
+          <p id="tableCount" class="pill">正在加载</p>
+          <div id="tableList" class="table-list"></div>
+        </section>
+      </aside>
+
+      <main class="panel content">
+        <section class="card">
+          <div class="toolbar">
+            <div>
+              <div class="section-title">
+                <h2>SQL 控制台</h2>
+              </div>
+              <p class="subtitle">输入 SELECT 会走查询接口，其他语句会走执行接口。支持上传 .sql 文件，并按顺序执行多条语句。</p>
+            </div>
+          </div>
+          <textarea id="sqlInput" class="sql-input" spellcheck="false">SELECT * FROM "sample"</textarea>
+          <div class="actions">
+            <input id="sqlFileInput" class="file-input" type="file" accept=".sql,.xlsx,text/sql,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+            <button id="runSqlButton" class="action action-primary" type="button">执行 SQL</button>
+            <button id="loadSelectedButton" class="action action-secondary" type="button">重新加载当前表</button>
+          </div>
+          <p id="status" class="status"></p>
+        </section>
+
+        <section class="card">
+          <div class="toolbar">
+            <div>
+              <div class="section-title">
+                <h3>查询结果</h3>
+              </div>
+              <div id="resultMeta" class="result-meta"></div>
+            </div>
+          </div>
+          <div id="resultContainer" class="empty">点击左侧表名，或者在上方执行一条 SQL。</div>
+          <div id="pagination" class="pagination" hidden>
+            <div id="paginationInfo" class="pagination-info"></div>
+            <div class="pagination-actions">
+              <label>
+                每页
+                <select id="pageSizeSelect" class="page-size">
+                  <option value="10">10</option>
+                  <option value="25" selected>25</option>
+                  <option value="50">50</option>
+                  <option value="100">100</option>
+                </select>
+                行
+              </label>
+              <button id="prevPageButton" class="action action-secondary" type="button">上一页</button>
+              <button id="nextPageButton" class="action action-secondary" type="button">下一页</button>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script type="module">
+      import { backend } from 'declarations/backend';
+      import { readImportFile } from './importer.js';
+
+      const state = {
+        tables: [],
+        selectedTable: '',
+        loading: false,
+        currentTitle: '',
+        currentColumns: [],
+        currentRows: [],
+        currentPage: 1,
+        pageSize: 25,
+      };
+
+      const elements = {
+        tableList: document.querySelector('#tableList'),
+        tableCount: document.querySelector('#tableCount'),
+        refreshTablesButton: document.querySelector('#refreshTablesButton'),
+        loadSelectedButton: document.querySelector('#loadSelectedButton'),
+        runSqlButton: document.querySelector('#runSqlButton'),
+        sqlFileInput: document.querySelector('#sqlFileInput'),
+        sqlInput: document.querySelector('#sqlInput'),
+        status: document.querySelector('#status'),
+        resultMeta: document.querySelector('#resultMeta'),
+        resultContainer: document.querySelector('#resultContainer'),
+        pagination: document.querySelector('#pagination'),
+        paginationInfo: document.querySelector('#paginationInfo'),
+        pageSizeSelect: document.querySelector('#pageSizeSelect'),
+        prevPageButton: document.querySelector('#prevPageButton'),
+        nextPageButton: document.querySelector('#nextPageButton'),
+      };
+
+      function setBusy(isBusy) {
+        state.loading = isBusy;
+        elements.refreshTablesButton.disabled = isBusy;
+        elements.loadSelectedButton.disabled = isBusy;
+        elements.runSqlButton.disabled = isBusy;
+        elements.sqlFileInput.disabled = isBusy;
+        elements.pageSizeSelect.disabled = isBusy;
+        elements.prevPageButton.disabled = isBusy;
+        elements.nextPageButton.disabled = isBusy;
+      }
+
+      function setStatus(message, kind = '') {
+        elements.status.textContent = message;
+        elements.status.className = kind ? `status ${kind}` : 'status';
+      }
+
+      function escapeHtml(value) {
+        return String(value)
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#39;');
+      }
+
+      function quoteIdentifier(name) {
+        return `"${String(name).replaceAll('"', '""')}"`;
+      }
+
+      function sqlValueToText(cell) {
+        if ('Null' in cell) {
+          return 'NULL';
+        }
+
+        if ('Integer' in cell) {
+          return String(cell.Integer);
+        }
+
+        if ('Float' in cell) {
+          return String(cell.Float);
+        }
+
+        if ('Text' in cell) {
+          return cell.Text;
+        }
+
+        if ('Blob' in cell) {
+          return `[${cell.Blob.length} bytes]`;
+        }
+
+        return JSON.stringify(cell);
+      }
+
+      function splitSqlStatements(sqlText) {
+        const statements = [];
+        let current = '';
+        let inSingleQuote = false;
+        let inDoubleQuote = false;
+        let inLineComment = false;
+        let inBlockComment = false;
+
+        for (let index = 0; index < sqlText.length; index += 1) {
+          const char = sqlText[index];
+          const next = sqlText[index + 1] ?? '';
+
+          if (inLineComment) {
+            current += char;
+            if (char === '\n') {
+              inLineComment = false;
+            }
+            continue;
+          }
+
+          if (inBlockComment) {
+            current += char;
+            if (char === '*' && next === '/') {
+              current += next;
+              index += 1;
+              inBlockComment = false;
+            }
+            continue;
+          }
+
+          if (!inSingleQuote && !inDoubleQuote && char === '-' && next === '-') {
+            current += char + next;
+            index += 1;
+            inLineComment = true;
+            continue;
+          }
+
+          if (!inSingleQuote && !inDoubleQuote && char === '/' && next === '*') {
+            current += char + next;
+            index += 1;
+            inBlockComment = true;
+            continue;
+          }
+
+          if (char === '\'' && !inDoubleQuote) {
+            current += char;
+            if (inSingleQuote && next === '\'') {
+              current += next;
+              index += 1;
+            } else {
+              inSingleQuote = !inSingleQuote;
+            }
+            continue;
+          }
+
+          if (char === '"' && !inSingleQuote) {
+            current += char;
+            if (inDoubleQuote && next === '"') {
+              current += next;
+              index += 1;
+            } else {
+              inDoubleQuote = !inDoubleQuote;
+            }
+            continue;
+          }
+
+          if (char === ';' && !inSingleQuote && !inDoubleQuote) {
+            const trimmed = current.trim();
+            if (trimmed) {
+              statements.push(trimmed);
+            }
+            current = '';
+            continue;
+          }
+
+          current += char;
+        }
+
+        const tail = current.trim();
+        if (tail) {
+          statements.push(tail);
+        }
+
+        return statements;
+      }
+
+      async function executeStatements(sqlText) {
+        const statements = splitSqlStatements(sqlText);
+
+        if (statements.length === 0) {
+          throw new Error('SQL 文件中没有可执行语句');
+        }
+
+        if (statements.length === 1) {
+          const [statement] = statements;
+          const isSelect = /^select\b/i.test(statement);
+
+          if (isSelect) {
+            const result = await backend.query(statement);
+            if ('Err' in result) {
+              throw new Error(result.Err);
+            }
+
+            return {
+              statements,
+              lastQueryResult: result.Ok,
+              changedSchemaOrData: false,
+            };
+          }
+
+          const result = await backend.execute(statement);
+          if ('Err' in result) {
+            throw new Error(result.Err);
+          }
+
+          return {
+            statements,
+            lastQueryResult: null,
+            changedSchemaOrData: true,
+          };
+        }
+
+        const result = await backend.execute_batch(statements);
+        if ('Err' in result) {
+          throw new Error(result.Err);
+        }
+
+        const batch = result.Ok;
+
+        return {
+          statements,
+          lastQueryResult: batch.has_query_result ? batch.last_query_result : null,
+          changedSchemaOrData: batch.changed_schema_or_data,
+        };
+      }
+
+      function renderTables() {
+        elements.tableCount.textContent = `共 ${state.tables.length} 张表`;
+
+        if (state.tables.length === 0) {
+          elements.tableList.innerHTML = '<div class="empty">当前数据库还没有表。</div>';
+          return;
+        }
+
+        elements.tableList.innerHTML = state.tables
+          .map((tableName) => {
+            const activeClass = tableName === state.selectedTable ? ' active' : '';
+            return `
+              <button class="table-button${activeClass}" type="button" data-table="${escapeHtml(tableName)}">
+                ${escapeHtml(tableName)}
+              </button>
+            `;
+          })
+          .join('');
+
+        elements.tableList.querySelectorAll('[data-table]').forEach((button) => {
+          button.addEventListener('click', () => loadTable(button.dataset.table));
+        });
+      }
+
+      function getTotalPages() {
+        return Math.max(1, Math.ceil(state.currentRows.length / state.pageSize));
+      }
+
+      function clampCurrentPage() {
+        state.currentPage = Math.min(Math.max(1, state.currentPage), getTotalPages());
+      }
+
+      function renderPagination() {
+        const hasColumns = state.currentColumns.length > 0;
+        const hasRows = state.currentRows.length > 0;
+
+        if (!hasColumns) {
+          elements.pagination.hidden = true;
+          elements.paginationInfo.textContent = '';
+          return;
+        }
+
+        clampCurrentPage();
+
+        const totalPages = getTotalPages();
+        const start = hasRows ? (state.currentPage - 1) * state.pageSize + 1 : 0;
+        const end = hasRows ? Math.min(state.currentPage * state.pageSize, state.currentRows.length) : 0;
+
+        elements.pagination.hidden = false;
+        elements.pageSizeSelect.value = String(state.pageSize);
+        elements.paginationInfo.textContent = hasRows
+          ? `第 ${state.currentPage} / ${totalPages} 页，显示 ${start}-${end}，共 ${state.currentRows.length} 行`
+          : '当前结果没有数据行';
+        elements.prevPageButton.disabled = state.loading || state.currentPage <= 1;
+        elements.nextPageButton.disabled = state.loading || state.currentPage >= totalPages;
+      }
+
+      function renderResult(title, columns = [], rows = [], options = {}) {
+        if (options.resetPage !== false) {
+          state.currentPage = 1;
+        }
+
+        state.currentTitle = title;
+        state.currentColumns = [...columns];
+        state.currentRows = [...rows];
+        clampCurrentPage();
+
+        const startIndex = (state.currentPage - 1) * state.pageSize;
+        const visibleRows = state.currentRows.slice(startIndex, startIndex + state.pageSize);
+
+        elements.resultMeta.innerHTML = `
+          <span class="pill">${escapeHtml(title)}</span>
+          <span>列数 ${columns.length}</span>
+          <span>总行数 ${rows.length}</span>
+        `;
+
+        if (columns.length === 0) {
+          elements.resultContainer.innerHTML = '<div class="empty">当前结果没有列信息。</div>';
+          renderPagination();
+          return;
+        }
+
+        const header = columns.map((column) => `<th>${escapeHtml(column)}</th>`).join('');
+        const body = visibleRows.length > 0
+          ? visibleRows
+              .map((row) => {
+                const cells = row
+                  .map((cell) => `<td>${escapeHtml(sqlValueToText(cell))}</td>`)
+                  .join('');
+                return `<tr>${cells}</tr>`;
+              })
+              .join('')
+          : `<tr><td colspan="${columns.length}">当前页没有数据</td></tr>`;
+
+        elements.resultContainer.innerHTML = `
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>${header}</tr>
+              </thead>
+              <tbody>${body}</tbody>
+            </table>
+          </div>
+        `;
+
+        renderPagination();
+      }
+
+      function renderEmptyResult(message) {
+        state.currentTitle = '';
+        state.currentColumns = [];
+        state.currentRows = [];
+        state.currentPage = 1;
+        elements.resultMeta.innerHTML = '';
+        elements.resultContainer.innerHTML = `<div class="empty">${escapeHtml(message)}</div>`;
+        renderPagination();
+      }
+
+      async function refreshTables() {
+        if (!backend) {
+          renderEmptyResult('找不到 backend actor，请先运行 dfx deploy backend。');
+          setStatus('未检测到 backend canister 环境变量。', 'error');
+          return;
+        }
+
+        setBusy(true);
+
+        try {
+          const info = await backend.info();
+          state.tables = [...info.tables];
+
+          if (state.selectedTable && !state.tables.includes(state.selectedTable)) {
+            state.selectedTable = '';
+          }
+
+          renderTables();
+          setStatus(`已加载 ${state.tables.length} 张表。`, 'success');
+        } catch (error) {
+          renderEmptyResult('读取表列表失败。');
+          setStatus(`读取表列表失败：${error.message}`, 'error');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function loadTable(tableName) {
+        if (!backend) {
+          return;
+        }
+
+        state.selectedTable = tableName;
+        renderTables();
+        setBusy(true);
+        setStatus(`正在读取表 ${tableName} ...`);
+
+        try {
+          const sql = `SELECT * FROM ${quoteIdentifier(tableName)}`;
+          elements.sqlInput.value = sql;
+          const result = await backend.query(sql);
+
+          if ('Err' in result) {
+            throw new Error(result.Err);
+          }
+
+          renderResult(`表 ${tableName}`, result.Ok.columns, result.Ok.rows);
+          setStatus(`已展示表 ${tableName} 的数据。`, 'success');
+        } catch (error) {
+          renderEmptyResult(`读取表 ${tableName} 失败。`);
+          setStatus(`读取表失败：${error.message}`, 'error');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      async function runSql() {
+        if (!backend) {
+          return;
+        }
+
+        const sql = elements.sqlInput.value.trim();
+
+        if (!sql) {
+          setStatus('请先输入 SQL。', 'error');
+          return;
+        }
+
+        setBusy(true);
+        setStatus('正在执行 SQL ...');
+
+        try {
+          const execution = await executeStatements(sql);
+
+          if (execution.changedSchemaOrData) {
+            await refreshTables();
+          }
+
+          if (execution.lastQueryResult) {
+            renderResult('自定义查询', execution.lastQueryResult.columns, execution.lastQueryResult.rows);
+          } else if (state.selectedTable && state.tables.includes(state.selectedTable)) {
+            await loadTable(state.selectedTable);
+          } else {
+            renderEmptyResult('SQL 执行成功。可以点击左侧表名查看数据。');
+          }
+
+          setStatus(`SQL 执行成功，共执行 ${execution.statements.length} 条语句。`, 'success');
+        } catch (error) {
+          setStatus(`SQL 执行失败：${error.message}`, 'error');
+        } finally {
+          setBusy(false);
+        }
+      }
+
+      elements.refreshTablesButton.addEventListener('click', refreshTables);
+      elements.loadSelectedButton.addEventListener('click', () => {
+        if (state.selectedTable) {
+          loadTable(state.selectedTable);
+        } else {
+          setStatus('请先从左侧选择一张表。', 'error');
+        }
+      });
+      elements.runSqlButton.addEventListener('click', runSql);
+      elements.sqlFileInput.addEventListener('change', async () => {
+        const [file] = elements.sqlFileInput.files ?? [];
+
+        if (!file) {
+          return;
+        }
+
+        try {
+          const imported = await readImportFile(file);
+          elements.sqlInput.value = imported.sqlText;
+
+          if (imported.kind === 'xlsx') {
+            setStatus(`已载入 Excel 文件并转换为 SQL：${imported.sourceName}，共 ${imported.sheetCount} 个工作表`, 'success');
+          } else {
+            setStatus(`已载入 SQL 文件：${imported.sourceName}`, 'success');
+          }
+        } catch (error) {
+          setStatus(`读取导入文件失败：${error.message}`, 'error');
+        }
+      });
+      elements.prevPageButton.addEventListener('click', () => {
+        if (state.currentPage > 1) {
+          state.currentPage -= 1;
+          renderResult(state.currentTitle, state.currentColumns, state.currentRows, { resetPage: false });
+        }
+      });
+      elements.nextPageButton.addEventListener('click', () => {
+        if (state.currentPage < getTotalPages()) {
+          state.currentPage += 1;
+          renderResult(state.currentTitle, state.currentColumns, state.currentRows, { resetPage: false });
+        }
+      });
+      elements.pageSizeSelect.addEventListener('change', () => {
+        state.pageSize = Number(elements.pageSizeSelect.value);
+        state.currentPage = 1;
+
+        if (state.currentColumns.length > 0) {
+          renderResult(state.currentTitle, state.currentColumns, state.currentRows, { resetPage: false });
+        }
+      });
+
+      async function init() {
+        await refreshTables();
+
+        if (state.tables.length > 0) {
+          await loadTable(state.tables[0]);
+        } else {
+          renderEmptyResult('当前没有表。你可以先在上方执行 CREATE TABLE。');
+        }
+      }
+
+      init().catch((error) => {
+        renderEmptyResult('页面初始化失败。');
+        setStatus(`页面初始化失败：${error.message}`, 'error');
+      });
+    </script>
+  </body>
+</html>

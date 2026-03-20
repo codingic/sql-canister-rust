@@ -1,0 +1,34 @@
+type SqlValue = variant {
+  Null;
+  Integer : int64;
+  Float : float64;
+  Text : text;
+  Blob : vec nat8;
+};
+
+type ExecuteResult = record {
+  message : text;
+};
+
+type QueryResult = record {
+  columns : vec text;
+  rows : vec vec SqlValue;
+};
+
+type DatabaseInfo = record {
+  tables : vec text;
+};
+
+type BatchExecuteResult = record {
+  statements_executed : nat32;
+  changed_schema_or_data : bool;
+  has_query_result : bool;
+  last_query_result : QueryResult;
+};
+
+service : {
+  execute : (text) -> (variant { Ok : ExecuteResult; Err : text });
+  execute_batch : (vec text) -> (variant { Ok : BatchExecuteResult; Err : text });
+  info : () -> (DatabaseInfo) query;
+  "query" : (text) -> (variant { Ok : QueryResult; Err : text }) query;
+}
