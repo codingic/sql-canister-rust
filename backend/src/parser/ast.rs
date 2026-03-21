@@ -3,10 +3,11 @@
 #![allow(missing_docs)]
 
 use crate::types::Value;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// A SQL statement (simplified)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Statement {
     /// SELECT statement
     Select(SelectStmt),
@@ -51,7 +52,7 @@ pub enum Statement {
 }
 
 /// SELECT statement (simplified)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SelectStmt {
     /// DISTINCT modifier
     pub distinct: bool,
@@ -74,7 +75,7 @@ pub struct SelectStmt {
 }
 
 /// Compound SELECT statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompoundSelectStmt {
     /// Left-most select
     pub left: SelectStmt,
@@ -89,7 +90,7 @@ pub struct CompoundSelectStmt {
 }
 
 /// IN expression right-hand side
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum InSource {
     /// Explicit expression list
     List(Vec<Expr>),
@@ -98,7 +99,7 @@ pub enum InSource {
 }
 
 /// One compound SELECT segment
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CompoundSelectPart {
     /// Compound operator
     pub operator: CompoundOperator,
@@ -107,7 +108,7 @@ pub struct CompoundSelectPart {
 }
 
 /// Supported compound operators
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CompoundOperator {
     /// UNION DISTINCT
     Union,
@@ -120,7 +121,7 @@ pub enum CompoundOperator {
 }
 
 /// Result column in SELECT
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ResultColumn {
     /// *
     Star,
@@ -131,7 +132,7 @@ pub enum ResultColumn {
 }
 
 /// FROM clause
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FromClause {
     /// Table references
     pub tables: Vec<TableRef>,
@@ -140,7 +141,7 @@ pub struct FromClause {
 }
 
 /// Join operator between adjacent table references
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JoinClause {
     /// Join kind
     pub kind: JoinKind,
@@ -149,7 +150,7 @@ pub struct JoinClause {
 }
 
 /// Supported join kinds
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinKind {
     /// Comma join or CROSS JOIN
     Cross,
@@ -160,7 +161,7 @@ pub enum JoinKind {
 }
 
 /// Supported join constraints
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum JoinConstraint {
     /// ON predicate
     On(Expr),
@@ -169,7 +170,7 @@ pub enum JoinConstraint {
 }
 
 /// Table reference
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TableRef {
     /// Table name
     pub name: String,
@@ -180,7 +181,7 @@ pub struct TableRef {
 }
 
 /// ORDER BY item
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OrderByItem {
     pub expr: Expr,
     pub ascending: bool,
@@ -188,7 +189,7 @@ pub struct OrderByItem {
 }
 
 /// Expression (simplified to avoid recursive type issues)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expr {
     /// Literal value
     Literal(Value),
@@ -239,7 +240,7 @@ pub enum Expr {
 }
 
 /// Unary operators
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnaryOp {
     Negate,
     Not,
@@ -247,7 +248,7 @@ pub enum UnaryOp {
 }
 
 /// Binary operators
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BinaryOp {
     Add,
     Subtract,
@@ -266,7 +267,7 @@ pub enum BinaryOp {
 }
 
 /// INSERT statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InsertStmt {
     /// Table name
     pub table: String,
@@ -274,12 +275,44 @@ pub struct InsertStmt {
     pub schema: Option<String>,
     /// Column names
     pub columns: Vec<String>,
-    /// Values to insert
-    pub values: Vec<Vec<Expr>>,
+    /// Insert source
+    pub source: InsertSource,
+    /// Optional UPSERT clause
+    pub on_conflict: Option<OnConflictClause>,
+}
+
+/// INSERT source
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum InsertSource {
+    /// VALUES clause
+    Values(Vec<Vec<Expr>>),
+    /// INSERT FROM SELECT / compound SELECT
+    Select(Box<Statement>),
+}
+
+/// UPSERT clause attached to INSERT
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OnConflictClause {
+    /// Optional conflict target column names
+    pub target_columns: Vec<String>,
+    /// Action when a uniqueness conflict is found
+    pub action: OnConflictAction,
+}
+
+/// UPSERT conflict action
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum OnConflictAction {
+    /// Skip the conflicting row
+    DoNothing,
+    /// Update the conflicting row
+    DoUpdate {
+        assignments: Vec<(String, Expr)>,
+        where_clause: Option<Expr>,
+    },
 }
 
 /// UPDATE statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateStmt {
     /// Table name
     pub table: String,
@@ -292,7 +325,7 @@ pub struct UpdateStmt {
 }
 
 /// DELETE statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeleteStmt {
     /// Table name
     pub table: String,
@@ -303,7 +336,7 @@ pub struct DeleteStmt {
 }
 
 /// CREATE TABLE statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateTableStmt {
     /// IF NOT EXISTS
     pub if_not_exists: bool,
@@ -316,7 +349,7 @@ pub struct CreateTableStmt {
 }
 
 /// Column definition
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ColumnDef {
     pub name: String,
     pub type_name: Option<String>,
@@ -324,7 +357,7 @@ pub struct ColumnDef {
 }
 
 /// Column constraint
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ColumnConstraint {
     PrimaryKey { auto_increment: bool },
     NotNull,
@@ -335,7 +368,7 @@ pub enum ColumnConstraint {
 }
 
 /// Foreign key clause
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ForeignKeyClause {
     pub table: String,
     pub schema: Option<String>,
@@ -343,7 +376,7 @@ pub struct ForeignKeyClause {
 }
 
 /// CREATE INDEX statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateIndexStmt {
     pub unique: bool,
     pub if_not_exists: bool,
@@ -355,7 +388,7 @@ pub struct CreateIndexStmt {
 }
 
 /// Indexed column
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexedColumn {
     pub name: String,
     pub collation: Option<String>,
@@ -363,7 +396,7 @@ pub struct IndexedColumn {
 }
 
 /// CREATE VIEW statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateViewStmt {
     pub if_not_exists: bool,
     pub temp: bool,
@@ -374,13 +407,13 @@ pub struct CreateViewStmt {
 }
 
 /// CREATE TRIGGER statement (stub)
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateTriggerStmt {
     pub name: String,
 }
 
 /// DROP statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DropStmt {
     pub object_type: ObjectType,
     pub if_exists: bool,
@@ -389,7 +422,7 @@ pub struct DropStmt {
 }
 
 /// Object type for DROP
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ObjectType {
     Table,
     Index,
@@ -398,7 +431,7 @@ pub enum ObjectType {
 }
 
 /// ALTER TABLE statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlterTableStmt {
     pub table: String,
     pub schema: Option<String>,
@@ -406,7 +439,7 @@ pub struct AlterTableStmt {
 }
 
 /// Alter action
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AlterAction {
     RenameTo(String),
     AddColumn(ColumnDef),
@@ -415,13 +448,13 @@ pub enum AlterAction {
 }
 
 /// BEGIN statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BeginStmt {
     pub transaction_type: Option<TransactionType>,
 }
 
 /// Transaction type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TransactionType {
     Deferred,
     Immediate,
@@ -429,13 +462,13 @@ pub enum TransactionType {
 }
 
 /// ROLLBACK statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RollbackStmt {
     pub savepoint: Option<String>,
 }
 
 /// PRAGMA statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PragmaStmt {
     pub schema: Option<String>,
     pub name: String,
@@ -443,28 +476,28 @@ pub struct PragmaStmt {
 }
 
 /// PRAGMA value
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PragmaValue {
     Expr(Expr),
     Equals(Expr),
 }
 
 /// EXPLAIN statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExplainStmt {
     pub query_plan: bool,
     pub statement: Box<Statement>,
 }
 
 /// VACUUM statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VacuumStmt {
     pub schema: Option<String>,
     pub into: Option<String>,
 }
 
 /// ANALYZE statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnalyzeStmt {
     pub schema: Option<String>,
     pub table: Option<String>,
@@ -472,7 +505,7 @@ pub struct AnalyzeStmt {
 }
 
 /// ATTACH statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AttachStmt {
     pub database: Expr,
     pub name: String,
@@ -480,7 +513,7 @@ pub struct AttachStmt {
 }
 
 /// DETACH statement
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DetachStmt {
     pub name: String,
 }

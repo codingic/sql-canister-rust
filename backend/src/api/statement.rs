@@ -2,7 +2,7 @@
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::types::Value;
-use crate::parser::ast::{Statement as AstStatement, AlterAction, ColumnConstraint, ColumnDef, CompoundOperator, CompoundSelectStmt, Expr, FromClause, InSource, JoinClause, JoinConstraint, JoinKind, OrderByItem, ResultColumn, SelectStmt, BinaryOp, UnaryOp};
+use crate::parser::ast::{Statement as AstStatement, AlterAction, ColumnConstraint, ColumnDef, CompoundOperator, CompoundSelectStmt, Expr, FromClause, InSource, InsertSource, JoinClause, JoinConstraint, JoinKind, OnConflictAction, OrderByItem, ResultColumn, SelectStmt, BinaryOp, UnaryOp};
 use crate::storage::{Column, Storage, Table};
 use super::connection::{Connection, IntoParams};
 #[cfg(feature = "thread-safe")]
@@ -482,7 +482,7 @@ impl Statement {
 
                 let mut columns = Vec::new();
                 for col_def in &create.columns {
-                    columns.push(build_storage_column(col_def));
+                    columns.push(build_storage_column(col_def)?);
                 }
                 storage.create_table(&create.name, columns)?;
                 self.state = StatementState::Done;
@@ -503,7 +503,7 @@ impl Statement {
                         storage.rename_column(&alter.table, old, new)?;
                     }
                     AlterAction::AddColumn(column) => {
-                        storage.add_column(&alter.table, build_storage_column(column))?;
+                        storage.add_column(&alter.table, build_storage_column(column)?)?;
                     }
                     other => {
                         return Err(Error::sqlite(
@@ -524,7 +524,7 @@ impl Statement {
                 let mut storage = self.storage.borrow_mut();
 
                 // Get column mapping info first
-                let (col_indices, num_cols, defaults) = {
+                let (col_indices, num_cols, defaults, source_rows) = {
                     let table = storage.get_table(&insert.table)
                         .ok_or_else(|| Error::sqlite(ErrorCode::Error, &format!("no such table: {}", insert.table)))?;
 
@@ -545,26 +545,64 @@ impl Statement {
                         .map(|column| column.default_value.clone())
                         .collect::<Vec<_>>();
 
-                    (col_indices, table.columns.len(), defaults)
+                    let source_rows = resolve_insert_source_rows(&insert.source, &storage)?;
+
+                    if let Some(actual_width) = source_rows.first().map(Vec::len) {
+                        let expected_width = col_indices.len();
+                        if actual_width != expected_width {
+                            return Err(Error::sqlite(
+                                ErrorCode::Error,
+                                format!(
+                                    "INSERT INTO ... SELECT returned {} columns but {} target columns were specified",
+                                    actual_width,
+                                    expected_width,
+                                ),
+                            ));
+                        }
+                    }
+
+                    (col_indices, table.columns.len(), defaults, source_rows)
                 };
 
                 // Insert each row
                 let table_name = insert.table.clone();
-                for row_exprs in &insert.values {
-                    let mut values = vec![Value::Null; num_cols];
+                for source_row in source_rows {
+                    let values = build_insert_row_values(
+                        &storage,
+                        &table_name,
+                        num_cols,
+                        &defaults,
+                        &col_indices,
+                        source_row,
+                    )?;
 
-                    for (column_index, default_value) in defaults.iter().enumerate() {
-                        if let Some(default_value) = default_value {
-                            values[column_index] = default_value.clone();
+                    if let Some(on_conflict) = &insert.on_conflict {
+                        storage.validate_non_unique_row(&table_name, &values)?;
+
+                        let conflict_row_index = {
+                            let table = storage.get_table(&table_name)
+                                .ok_or_else(|| Error::sqlite(ErrorCode::Error, &format!("no such table: {}", table_name)))?;
+                            find_upsert_conflict_row_index(table, &values, &on_conflict.target_columns)?
+                        };
+
+                        if let Some(conflict_row_index) = conflict_row_index {
+                            match &on_conflict.action {
+                                OnConflictAction::DoNothing => continue,
+                                OnConflictAction::DoUpdate { assignments, where_clause } => {
+                                    apply_upsert_update(
+                                        &mut storage,
+                                        &table_name,
+                                        conflict_row_index,
+                                        &values,
+                                        assignments,
+                                        where_clause.as_ref(),
+                                    )?;
+                                    continue;
+                                }
+                            }
                         }
                     }
 
-                    for (i, expr) in row_exprs.iter().enumerate() {
-                        if i < col_indices.len() {
-                            let val = eval_expr_to_value(&expr)?;
-                            values[col_indices[i]] = val;
-                        }
-                    }
                     storage.insert(&table_name, values)?;
                 }
 
@@ -578,17 +616,32 @@ impl Statement {
                 #[cfg(not(feature = "thread-safe"))]
                 let mut storage = self.storage.borrow_mut();
 
-                let predicate = if let Some(where_expr) = &delete.where_clause {
-                    let table = storage.get_table(&delete.table)
-                        .ok_or_else(|| Error::sqlite(ErrorCode::Error, &format!("no such table: {}", delete.table)))?;
-                    Some(build_predicate(where_expr, table)?)
-                } else {
-                    None
-                };
-
                 let table_name = delete.table.clone();
-                let count = if let Some(pred) = predicate {
-                    storage.delete(&table_name, |row| pred(row))?
+                let count = if let Some(where_expr) = &delete.where_clause {
+                    let (predicate, primary_key_lookup) = {
+                        let table = storage.get_table(&delete.table)
+                            .ok_or_else(|| Error::sqlite(ErrorCode::Error, &format!("no such table: {}", delete.table)))?;
+                        let predicate = build_predicate(where_expr, table)?;
+                        let primary_key_lookup = extract_primary_key_lookup(where_expr, table, &[table.name.as_str()]);
+                        (predicate, primary_key_lookup)
+                    };
+
+                    if let Some(primary_key_value) = primary_key_lookup {
+                        if let Some(row_index) = storage.primary_key_row_index(&table_name, &primary_key_value)? {
+                            let matches = storage
+                                .row_at(&table_name, row_index)?
+                                .is_some_and(|row| predicate(row));
+                            if matches {
+                                storage.delete_row_index(&table_name, row_index)?
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        storage.delete(&table_name, |row| predicate(row))?
+                    }
                 } else {
                     storage.delete(&table_name, |_| true)?
                 };
@@ -611,17 +664,32 @@ impl Statement {
                     })
                     .collect::<Result<Vec<_>>>()?;
 
-                let predicate = if let Some(where_expr) = &update.where_clause {
-                    let table = storage.get_table(&update.table)
-                        .ok_or_else(|| Error::sqlite(ErrorCode::Error, &format!("no such table: {}", update.table)))?;
-                    Some(build_predicate(where_expr, table)?)
-                } else {
-                    None
-                };
-
                 let table_name = update.table.clone();
-                let count = if let Some(pred) = predicate {
-                    storage.update(&table_name, &updates, |row| pred(row))?
+                let count = if let Some(where_expr) = &update.where_clause {
+                    let (predicate, primary_key_lookup) = {
+                        let table = storage.get_table(&update.table)
+                            .ok_or_else(|| Error::sqlite(ErrorCode::Error, &format!("no such table: {}", update.table)))?;
+                        let predicate = build_predicate(where_expr, table)?;
+                        let primary_key_lookup = extract_primary_key_lookup(where_expr, table, &[table.name.as_str()]);
+                        (predicate, primary_key_lookup)
+                    };
+
+                    if let Some(primary_key_value) = primary_key_lookup {
+                        if let Some(row_index) = storage.primary_key_row_index(&table_name, &primary_key_value)? {
+                            let matches = storage
+                                .row_at(&table_name, row_index)?
+                                .is_some_and(|row| predicate(row));
+                            if matches {
+                                storage.update_row_index(&table_name, &updates, row_index)?
+                            } else {
+                                0
+                            }
+                        } else {
+                            0
+                        }
+                    } else {
+                        storage.update(&table_name, &updates, |row| predicate(row))?
+                    }
                 } else {
                     storage.update(&table_name, &updates, |_| true)?
                 };
@@ -735,8 +803,197 @@ impl Statement {
     }
 }
 
-fn build_storage_column(col_def: &ColumnDef) -> Column {
-    Column {
+fn resolve_insert_source_rows(source: &InsertSource, storage: &Storage) -> Result<Vec<Vec<Value>>> {
+    match source {
+        InsertSource::Values(rows) => rows
+            .iter()
+            .map(|row| row.iter().map(eval_expr_to_value).collect::<Result<Vec<_>>>())
+            .collect(),
+        InsertSource::Select(statement) => execute_query_ast(statement, storage),
+    }
+}
+
+fn build_insert_row_values(
+    storage: &Storage,
+    table_name: &str,
+    num_cols: usize,
+    defaults: &[Option<Value>],
+    col_indices: &[usize],
+    source_row: Vec<Value>,
+) -> Result<Vec<Value>> {
+    let mut values = vec![Value::Null; num_cols];
+
+    for (column_index, default_value) in defaults.iter().enumerate() {
+        if let Some(default_value) = default_value {
+            values[column_index] = default_value.clone();
+        }
+    }
+
+    for (index, value) in source_row.into_iter().enumerate() {
+        if index < col_indices.len() {
+            values[col_indices[index]] = value;
+        }
+    }
+
+    storage.prepare_insert_row(table_name, values)
+}
+
+fn find_upsert_conflict_row_index(table: &Table, row: &[Value], target_columns: &[String]) -> Result<Option<usize>> {
+    if target_columns.len() > 1 {
+        return Err(Error::sqlite(
+            ErrorCode::Error,
+            "ON CONFLICT currently supports a single target column",
+        ));
+    }
+
+    if let Some(target_column) = target_columns.first() {
+        let column_index = table
+            .column_index(target_column)
+            .ok_or_else(|| Error::sqlite(ErrorCode::Error, &format!("no such column: {}", target_column)))?;
+        if !table.is_unique_column(column_index) {
+            return Err(Error::sqlite(
+                ErrorCode::Error,
+                format!("ON CONFLICT column is not UNIQUE or PRIMARY KEY: {}", target_column),
+            ));
+        }
+
+        let value = row.get(column_index).unwrap_or(&Value::Null);
+        if value.is_null() {
+            return Ok(None);
+        }
+
+        return Ok(table.unique_row_index(column_index, value));
+    }
+
+    for (column_index, column) in table.columns.iter().enumerate() {
+        if !(column.primary_key || column.unique) {
+            continue;
+        }
+
+        let value = row.get(column_index).unwrap_or(&Value::Null);
+        if value.is_null() {
+            continue;
+        }
+
+        if let Some(row_index) = table.unique_row_index(column_index, value) {
+            return Ok(Some(row_index));
+        }
+    }
+
+    Ok(None)
+}
+
+fn build_upsert_context<'a>(table: &'a Table) -> QueryContext<'a> {
+    let width = table.columns.len();
+    QueryContext {
+        sources: vec![
+            QuerySource {
+                name: table.name.clone(),
+                alias: None,
+                start: 0,
+                table,
+            },
+            QuerySource {
+                name: "excluded".to_string(),
+                alias: None,
+                start: width,
+                table,
+            },
+        ],
+        unqualified_lookup: table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| (column.name.to_lowercase(), index))
+            .collect(),
+        qualified_lookup: table
+            .columns
+            .iter()
+            .enumerate()
+            .flat_map(|(index, column)| {
+                [
+                    (format!("{}:{}", table.name.to_lowercase(), column.name.to_lowercase()), index),
+                    (format!("excluded:{}", column.name.to_lowercase()), width + index),
+                ]
+            })
+            .collect(),
+    }
+}
+
+fn combine_upsert_rows(existing_row: &[Value], excluded_row: &[Value]) -> Vec<Value> {
+    existing_row
+        .iter()
+        .cloned()
+        .chain(excluded_row.iter().cloned())
+        .collect()
+}
+
+fn evaluate_upsert_expr(expr: &Expr, table: &Table, existing_row: &[Value], excluded_row: &[Value]) -> Result<Value> {
+    let combined_row = combine_upsert_rows(existing_row, excluded_row);
+    let context = build_upsert_context(table);
+    evaluate_expr(expr, &combined_row, &context, 1)
+}
+
+fn evaluate_upsert_where(expr: &Expr, table: &Table, existing_row: &[Value], excluded_row: &[Value]) -> bool {
+    let combined_row = combine_upsert_rows(existing_row, excluded_row);
+    let context = build_upsert_context(table);
+    evaluate_condition(expr, &combined_row, &context)
+}
+
+fn apply_upsert_update(
+    storage: &mut Storage,
+    table_name: &str,
+    row_index: usize,
+    excluded_row: &[Value],
+    assignments: &[(String, Expr)],
+    where_clause: Option<&Expr>,
+) -> Result<()> {
+    let (existing_row, updates) = {
+        let table = storage
+            .get_table(table_name)
+            .ok_or_else(|| Error::sqlite(ErrorCode::Error, &format!("no such table: {}", table_name)))?;
+        let existing_row = table
+            .row_at(row_index)
+            .ok_or_else(|| Error::sqlite(ErrorCode::Error, "conflicting row no longer exists"))?
+            .to_vec();
+
+        if where_clause.is_some_and(|expr| !evaluate_upsert_where(expr, table, &existing_row, excluded_row)) {
+            return Ok(());
+        }
+
+        let updates = assignments
+            .iter()
+            .map(|(column_name, expr)| {
+                Ok((
+                    column_name.clone(),
+                    evaluate_upsert_expr(expr, table, &existing_row, excluded_row)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        (existing_row, updates)
+    };
+
+    let _ = existing_row;
+    storage.update_row_index(table_name, &updates, row_index)?;
+    Ok(())
+}
+
+fn build_storage_column(col_def: &ColumnDef) -> Result<Column> {
+    let check_constraints = col_def
+        .constraints
+        .iter()
+        .filter_map(|constraint| match constraint {
+            ColumnConstraint::Check(expr) => Some(expr.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    for expr in &check_constraints {
+        validate_check_constraint_expr(expr)?;
+    }
+
+    Ok(Column {
         name: col_def.name.clone(),
         col_type: col_def
             .type_name
@@ -754,11 +1011,92 @@ fn build_storage_column(col_def: &ColumnDef) -> Column {
             .constraints
             .iter()
             .any(|c| matches!(c, ColumnConstraint::Unique)),
+        check_constraints,
         default_value: col_def.constraints.iter().find_map(|constraint| match constraint {
             ColumnConstraint::Default(expr) => eval_expr_to_value(expr).ok(),
             _ => None,
         }),
+    })
+}
+
+fn validate_check_constraint_expr(expr: &Expr) -> Result<()> {
+    match expr {
+        Expr::Subquery(_) | Expr::Exists(_) => Err(Error::sqlite(
+            ErrorCode::Error,
+            "CHECK constraint does not support subqueries",
+        )),
+        Expr::Function(name, args) => {
+            if is_aggregate_function(name) {
+                return Err(Error::sqlite(
+                    ErrorCode::Error,
+                    "CHECK constraint does not support aggregate functions",
+                ));
+            }
+
+            for arg in args {
+                validate_check_constraint_expr(arg)?;
+            }
+            Ok(())
+        }
+        Expr::Unary(_, inner)
+        | Expr::Parenthesized(inner)
+        | Expr::IsNull { expr: inner, .. } => validate_check_constraint_expr(inner),
+        Expr::Binary(_, left, right)
+        | Expr::Like { expr: left, pattern: right, .. } => {
+            validate_check_constraint_expr(left)?;
+            validate_check_constraint_expr(right)
+        }
+        Expr::In { expr, source, .. } => {
+            validate_check_constraint_expr(expr)?;
+            match source {
+                InSource::List(list) => {
+                    for item in list {
+                        validate_check_constraint_expr(item)?;
+                    }
+                    Ok(())
+                }
+                InSource::Subquery(_) => Err(Error::sqlite(
+                    ErrorCode::Error,
+                    "CHECK constraint does not support subqueries",
+                )),
+            }
+        }
+        Expr::Between { expr, low, high, .. } => {
+            validate_check_constraint_expr(expr)?;
+            validate_check_constraint_expr(low)?;
+            validate_check_constraint_expr(high)
+        }
+        _ => Ok(()),
     }
+}
+
+pub(crate) fn evaluate_check_constraint(
+    expr: &Expr,
+    table_name: &str,
+    columns: &[Column],
+    row: &[Value],
+) -> Result<bool> {
+    let context = QueryContext {
+        sources: Vec::new(),
+        unqualified_lookup: columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| (column.name.to_lowercase(), index))
+            .collect(),
+        qualified_lookup: columns
+            .iter()
+            .enumerate()
+            .map(|(index, column)| {
+                (
+                    format!("{}:{}", table_name.to_lowercase(), column.name.to_lowercase()),
+                    index,
+                )
+            })
+            .collect(),
+    };
+
+    let value = evaluate_expr(expr, row, &context, 1)?;
+    Ok(value.is_null() || value_to_bool(&value))
 }
 
 fn derive_select_column_info(select: &SelectStmt, storage: &Storage) -> Result<(Vec<String>, Vec<Option<String>>)> {
@@ -1196,9 +1534,23 @@ fn eval_expr_to_value(expr: &Expr) -> Result<Value> {
                 | BinaryOp::Less
                 | BinaryOp::LessEqual
                 | BinaryOp::Greater
-                | BinaryOp::GreaterEqual => Ok(Value::integer(compare_values(&left_val, &right_val, *op) as i64)),
-                BinaryOp::And => Ok(Value::integer((value_to_bool(&left_val) && value_to_bool(&right_val)) as i64)),
-                BinaryOp::Or => Ok(Value::integer((value_to_bool(&left_val) || value_to_bool(&right_val)) as i64)),
+                | BinaryOp::GreaterEqual => {
+                    if left_val.is_null() || right_val.is_null() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::integer(compare_values(&left_val, &right_val, *op) as i64))
+                    }
+                }
+                BinaryOp::And => Ok(match (truthiness(&left_val), truthiness(&right_val)) {
+                    (Some(false), _) | (_, Some(false)) => Value::integer(0),
+                    (Some(true), Some(true)) => Value::integer(1),
+                    _ => Value::Null,
+                }),
+                BinaryOp::Or => Ok(match (truthiness(&left_val), truthiness(&right_val)) {
+                    (Some(true), _) | (_, Some(true)) => Value::integer(1),
+                    (Some(false), Some(false)) => Value::integer(0),
+                    _ => Value::Null,
+                }),
             }
         }
         Expr::In { expr, not, source } => {
@@ -1343,7 +1695,10 @@ fn execute_select_query(select: &SelectStmt, storage: &Storage) -> Result<Vec<Ve
         return Ok(result_rows);
     };
 
-    let combined_rows = build_joined_rows(from, &context)?;
+    let combined_rows = match select_rows_by_primary_key(&select, &context) {
+        Some(rows) => rows,
+        None => build_joined_rows(from, &context)?,
+    };
     let mut matching_rows: Vec<&[Value]> = combined_rows.iter()
         .map(Vec::as_slice)
         .filter(|row| {
@@ -1548,6 +1903,63 @@ fn deduplicate_grouped_rows(rows: &mut Vec<GroupedResultRow<'_>>) {
     rows.retain(|row| seen.insert(row.row.clone()));
 }
 
+fn select_rows_by_primary_key(select: &SelectStmt, context: &QueryContext<'_>) -> Option<Vec<Vec<Value>>> {
+    let from = select.from.as_ref()?;
+    if from.tables.len() != 1 || !from.joins.is_empty() {
+        return None;
+    }
+
+    let where_expr = select.where_clause.as_ref()?;
+    let source = context.sources.first()?;
+    let mut source_names = vec![source.name.as_str()];
+    if let Some(alias) = &source.alias {
+        source_names.push(alias.as_str());
+    }
+
+    let primary_key_value = extract_primary_key_lookup(where_expr, source.table, &source_names)?;
+    let row_index = source.table.primary_key_row_index(&primary_key_value)?;
+    let row = source.table.row_at(row_index)?;
+    Some(vec![row.to_vec()])
+}
+
+fn extract_primary_key_lookup(expr: &Expr, table: &Table, source_names: &[&str]) -> Option<Value> {
+    match expr {
+        Expr::Parenthesized(inner) => extract_primary_key_lookup(inner, table, source_names),
+        Expr::Binary(BinaryOp::And, left, right) => {
+            extract_primary_key_lookup(left, table, source_names)
+                .or_else(|| extract_primary_key_lookup(right, table, source_names))
+        }
+        Expr::Binary(BinaryOp::Equal, left, right) => primary_key_match_value(left, right, table, source_names)
+            .or_else(|| primary_key_match_value(right, left, table, source_names)),
+        _ => None,
+    }
+}
+
+fn primary_key_match_value(identifier_expr: &Expr, value_expr: &Expr, table: &Table, source_names: &[&str]) -> Option<Value> {
+    primary_key_matches_identifier(identifier_expr, table, source_names)
+        .then(|| eval_expr_to_value(value_expr).ok())
+        .flatten()
+}
+
+fn primary_key_matches_identifier(expr: &Expr, table: &Table, source_names: &[&str]) -> bool {
+    let Some(primary_key_index) = table.primary_key_index() else {
+        return false;
+    };
+    let primary_key_name = &table.columns[primary_key_index].name;
+
+    match expr {
+        Expr::Identifier(name) => name.eq_ignore_ascii_case(primary_key_name),
+        Expr::QualifiedIdentifier(source_name, column_name) => {
+            column_name.eq_ignore_ascii_case(primary_key_name)
+                && source_names
+                    .iter()
+                    .any(|candidate| source_name.eq_ignore_ascii_case(candidate))
+        }
+        Expr::Parenthesized(inner) => primary_key_matches_identifier(inner, table, source_names),
+        _ => false,
+    }
+}
+
 fn build_predicate(expr: &Expr, table: &Table) -> Result<Box<dyn Fn(&[Value]) -> bool>> {
     let expr = expr.clone();
     let table = table.clone();
@@ -1703,6 +2115,14 @@ fn value_to_bool(val: &Value) -> bool {
     }
 }
 
+fn truthiness(val: &Value) -> Option<bool> {
+    if val.is_null() {
+        None
+    } else {
+        Some(value_to_bool(val))
+    }
+}
+
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(i1), Value::Integer(i2)) => i1 == i2,
@@ -1822,9 +2242,23 @@ fn evaluate_expr_in_group(
                 | BinaryOp::Less
                 | BinaryOp::LessEqual
                 | BinaryOp::Greater
-                | BinaryOp::GreaterEqual => Ok(Value::integer(compare_values(&left_val, &right_val, *op) as i64)),
-                BinaryOp::And => Ok(Value::integer((value_to_bool(&left_val) && value_to_bool(&right_val)) as i64)),
-                BinaryOp::Or => Ok(Value::integer((value_to_bool(&left_val) || value_to_bool(&right_val)) as i64)),
+                | BinaryOp::GreaterEqual => {
+                    if left_val.is_null() || right_val.is_null() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::integer(compare_values(&left_val, &right_val, *op) as i64))
+                    }
+                }
+                BinaryOp::And => Ok(match (truthiness(&left_val), truthiness(&right_val)) {
+                    (Some(false), _) | (_, Some(false)) => Value::integer(0),
+                    (Some(true), Some(true)) => Value::integer(1),
+                    _ => Value::Null,
+                }),
+                BinaryOp::Or => Ok(match (truthiness(&left_val), truthiness(&right_val)) {
+                    (Some(true), _) | (_, Some(true)) => Value::integer(1),
+                    (Some(false), Some(false)) => Value::integer(0),
+                    _ => Value::Null,
+                }),
             }
         }
         Expr::Function(name, args) => {
@@ -2057,11 +2491,16 @@ impl Rows {
             return Ok(None);
         }
 
-        if self.statement.step()? {
-            Ok(Some(self.statement.row()?))
-        } else {
-            self.exhausted = true;
-            Ok(None)
+        match self.statement.step() {
+            Ok(true) => Ok(Some(self.statement.row()?)),
+            Ok(false) => {
+                self.exhausted = true;
+                Ok(None)
+            }
+            Err(err) => {
+                self.exhausted = true;
+                Err(err)
+            }
         }
     }
 
@@ -2096,6 +2535,7 @@ mod tests {
             not_null: false,
             primary_key: false,
             unique: false,
+            check_constraints: Vec::new(),
             default_value: None,
         }
     }
@@ -2253,10 +2693,10 @@ mod tests {
     fn test_rows_iterator() {
         let conn = Connection::open_in_memory().unwrap();
         let stmt = Statement::new(&conn, AstStatement::Commit, "COMMIT".to_string()).unwrap();
-        let rows = Rows::new(stmt);
+        let mut rows = Rows::new(stmt);
 
-        let count = rows.count();
-        assert_eq!(count, 0);
+        assert!(Rows::next(&mut rows).is_err());
+        assert!(Iterator::next(&mut rows).is_none());
     }
 
     #[test]
@@ -2608,6 +3048,200 @@ mod tests {
 
         let rows = execute_select_query(&select, &storage).unwrap();
         assert_eq!(rows, vec![vec![Value::text("beta")]]);
+    }
+
+    #[test]
+    fn test_connection_insert_from_select() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute("CREATE TABLE source_users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)", [])
+            .unwrap();
+        conn.execute("CREATE TABLE archived_users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO source_users (id, name, active) VALUES (1, 'Alice', 1)", [])
+            .unwrap();
+        conn.execute("INSERT INTO source_users (id, name, active) VALUES (2, 'Bob', 0)", [])
+            .unwrap();
+        conn.execute("INSERT INTO source_users (id, name, active) VALUES (3, 'Carol', 1)", [])
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO archived_users (id, name) SELECT id, name FROM source_users WHERE active = 1 ORDER BY id",
+            [],
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT id, name FROM archived_users ORDER BY id", [])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(rows, vec![
+            vec![Value::integer(1), Value::text("Alice")],
+            vec![Value::integer(3), Value::text("Carol")],
+        ]);
+    }
+
+    #[test]
+    fn test_connection_insert_from_compound_select() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute("CREATE TABLE source_users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)", [])
+            .unwrap();
+        conn.execute("CREATE TABLE staged_users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO source_users (id, name, active) VALUES (1, 'Alice', 1)", [])
+            .unwrap();
+        conn.execute("INSERT INTO source_users (id, name, active) VALUES (2, 'Bob', 0)", [])
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO staged_users (id, name) SELECT id, name FROM source_users WHERE active = 1 UNION ALL SELECT id + 10, name FROM source_users WHERE active = 0 ORDER BY id",
+            [],
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT id, name FROM staged_users ORDER BY id", [])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(rows, vec![
+            vec![Value::integer(1), Value::text("Alice")],
+            vec![Value::integer(12), Value::text("Bob")],
+        ]);
+    }
+
+    #[test]
+    fn test_connection_insert_from_select_rejects_column_count_mismatch() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute("CREATE TABLE source_users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        conn.execute("CREATE TABLE target_users (id INTEGER PRIMARY KEY, name TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO source_users (id, name) VALUES (1, 'Alice')", [])
+            .unwrap();
+
+        let error = conn
+            .execute(
+                "INSERT INTO target_users (id, name) SELECT id FROM source_users",
+                [],
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("INSERT INTO ... SELECT returned 1 columns but 2 target columns were specified"));
+    }
+
+    #[test]
+    fn test_connection_upsert_do_nothing() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO users (id, name) VALUES (1, 'Alice')", [])
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO users (id, name) VALUES (1, 'Ignored') ON CONFLICT(id) DO NOTHING",
+            [],
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT id, name FROM users ORDER BY id", [])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(rows, vec![vec![Value::integer(1), Value::text("Alice")]]);
+    }
+
+    #[test]
+    fn test_connection_upsert_do_update_uses_excluded_values() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute(
+            "CREATE TABLE vocabulary (word TEXT PRIMARY KEY, count INTEGER NOT NULL, latest INTEGER NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO vocabulary (word, count, latest) VALUES ('jovial', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO vocabulary (word, count, latest) VALUES ('jovial', 2, 5) ON CONFLICT(word) DO UPDATE SET count = count + excluded.count, latest = excluded.latest",
+            [],
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT word, count, latest FROM vocabulary", [])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(rows, vec![vec![
+            Value::text("jovial"),
+            Value::integer(3),
+            Value::integer(5),
+        ]]);
+    }
+
+    #[test]
+    fn test_connection_upsert_do_update_where_can_skip_update() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute(
+            "CREATE TABLE metrics (name TEXT PRIMARY KEY, value INTEGER NOT NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO metrics (name, value) VALUES ('score', 10)", [])
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO metrics (name, value) VALUES ('score', 7) ON CONFLICT(name) DO UPDATE SET value = excluded.value WHERE excluded.value > metrics.value",
+            [],
+        )
+        .unwrap();
+
+        let rows = conn
+            .query("SELECT name, value FROM metrics", [])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(rows, vec![vec![Value::text("score"), Value::integer(10)]]);
+    }
+
+    #[test]
+    fn test_connection_upsert_rejects_non_unique_conflict_target() {
+        let conn = Connection::open_in_memory().unwrap();
+
+        conn.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
+            [],
+        )
+        .unwrap();
+
+        let error = conn
+            .execute(
+                "INSERT INTO users (id, name) VALUES (1, 'Alice') ON CONFLICT(name) DO NOTHING",
+                [],
+            )
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("ON CONFLICT column is not UNIQUE or PRIMARY KEY"));
     }
 
     #[test]

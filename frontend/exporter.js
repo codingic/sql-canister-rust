@@ -203,3 +203,30 @@ export function queryResultToXlsxBytes(tableName, columns, rows) {
   const workbook = queryResultToWorkbook(tableName, columns, rows);
   return write(workbook, { type: 'array', bookType: 'xlsx' });
 }
+
+function escapeTsvField(value) {
+  const text = String(value ?? '');
+  if (!/["\t\r\n]/.test(text)) {
+    return text;
+  }
+
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+export function queryResultToTsvText(columns, rows) {
+  if (!Array.isArray(columns) || columns.length === 0) {
+    throw new Error('没有可导出的列');
+  }
+
+  const lines = [columns.map(escapeTsvField).join('\t')];
+
+  for (const row of rows) {
+    lines.push(
+      columns
+        .map((_, index) => escapeTsvField(workbookValue(row[index])))
+        .join('\t')
+    );
+  }
+
+  return lines.join('\n');
+}

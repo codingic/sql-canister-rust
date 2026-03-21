@@ -150,6 +150,8 @@ pub enum TokenType {
     If,
     Replace,
     Ignore,
+    Do,
+    Nothing,
     Conflict,
     Abort,
     Fail,

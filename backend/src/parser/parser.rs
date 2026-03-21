@@ -727,7 +727,7 @@ impl<'a> Parser<'a> {
             vec![]
         };
 
-        let values = if self.consume(TokenType::Values)? {
+        let source = if self.consume(TokenType::Values)? {
             let mut rows = Vec::new();
             loop {
                 self.expect(TokenType::LeftParen)?;
@@ -739,17 +739,73 @@ impl<'a> Parser<'a> {
                     break;
                 }
             }
-            rows
+            InsertSource::Values(rows)
+        } else if self.current.ty == TokenType::Select {
+            InsertSource::Select(Box::new(self.parse_select()?))
         } else {
-            vec![]
+            return Err(Error::Parse("Expected VALUES or SELECT after INSERT INTO target".into()));
+        };
+
+        let on_conflict = if self.consume(TokenType::On)? {
+            self.expect(TokenType::Conflict)?;
+            Some(self.parse_on_conflict_clause()?)
+        } else {
+            None
         };
 
         Ok(Statement::Insert(InsertStmt {
             table,
             schema: None,
             columns,
-            values,
+            source,
+            on_conflict,
         }))
+    }
+
+    fn parse_on_conflict_clause(&mut self) -> Result<OnConflictClause> {
+        let target_columns = if self.consume(TokenType::LeftParen)? {
+            let columns = self.parse_identifier_list()?;
+            self.expect(TokenType::RightParen)?;
+            columns
+        } else {
+            Vec::new()
+        };
+
+        self.expect(TokenType::Do)?;
+        let action = if self.consume(TokenType::Nothing)? {
+            OnConflictAction::DoNothing
+        } else {
+            self.expect(TokenType::Update)?;
+            self.expect(TokenType::Set)?;
+
+            let mut assignments = Vec::new();
+            loop {
+                let col = self.parse_identifier()?;
+                self.expect(TokenType::Equal)?;
+                let expr = self.parse_expr()?;
+                assignments.push((col, expr));
+
+                if !self.consume(TokenType::Comma)? {
+                    break;
+                }
+            }
+
+            let where_clause = if self.consume(TokenType::Where)? {
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+
+            OnConflictAction::DoUpdate {
+                assignments,
+                where_clause,
+            }
+        };
+
+        Ok(OnConflictClause {
+            target_columns,
+            action,
+        })
     }
 
     fn parse_update(&mut self) -> Result<Statement> {
@@ -879,6 +935,12 @@ impl<'a> Parser<'a> {
                 TokenType::Unique => {
                     self.advance();
                     constraints.push(ColumnConstraint::Unique);
+                }
+                TokenType::Check => {
+                    self.advance();
+                    self.expect(TokenType::LeftParen)?;
+                    constraints.push(ColumnConstraint::Check(self.parse_expr()?));
+                    self.expect(TokenType::RightParen)?;
                 }
                 TokenType::Default => {
                     self.advance();
@@ -1204,7 +1266,66 @@ mod tests {
     #[test]
     fn test_parse_insert() {
         let stmt = parse_sql("INSERT INTO users (name) VALUES ('Alice')").unwrap();
-        assert!(matches!(stmt, Statement::Insert(_)));
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected insert statement");
+        };
+
+        assert!(matches!(insert.source, InsertSource::Values(_)));
+        assert!(insert.on_conflict.is_none());
+    }
+
+    #[test]
+    fn test_parse_insert_from_select() {
+        let stmt = parse_sql("INSERT INTO archived_users (id, name) SELECT id, name FROM users WHERE active = 1").unwrap();
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected insert statement");
+        };
+
+        assert!(matches!(insert.source, InsertSource::Select(_)));
+        assert!(insert.on_conflict.is_none());
+    }
+
+    #[test]
+    fn test_parse_insert_with_on_conflict_do_nothing() {
+        let stmt = parse_sql("INSERT INTO users (id, name) VALUES (1, 'Alice') ON CONFLICT(id) DO NOTHING").unwrap();
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected insert statement");
+        };
+
+        let on_conflict = insert.on_conflict.expect("expected on conflict clause");
+        assert_eq!(on_conflict.target_columns, vec!["id"]);
+        assert!(matches!(on_conflict.action, OnConflictAction::DoNothing));
+    }
+
+    #[test]
+    fn test_parse_insert_with_on_conflict_do_update() {
+        let stmt = parse_sql(
+            "INSERT INTO users (id, name, visits) VALUES (1, 'Alice', 2) ON CONFLICT(id) DO UPDATE SET name = excluded.name, visits = visits + excluded.visits WHERE excluded.visits > 0"
+        ).unwrap();
+        let Statement::Insert(insert) = stmt else {
+            panic!("expected insert statement");
+        };
+
+        let on_conflict = insert.on_conflict.expect("expected on conflict clause");
+        assert_eq!(on_conflict.target_columns, vec!["id"]);
+        assert!(matches!(
+            on_conflict.action,
+            OnConflictAction::DoUpdate {
+                assignments,
+                where_clause: Some(_),
+            } if assignments.len() == 2
+        ));
+    }
+
+    #[test]
+    fn test_parse_create_table_with_check() {
+        let stmt = parse_sql("CREATE TABLE users (age INTEGER CHECK (age >= 18), score REAL CHECK (score <= 100))").unwrap();
+        let Statement::CreateTable(create) = stmt else {
+            panic!("expected create table statement");
+        };
+
+        assert!(matches!(create.columns[0].constraints[0], ColumnConstraint::Check(_)));
+        assert!(matches!(create.columns[1].constraints[0], ColumnConstraint::Check(_)));
     }
 
     #[test]

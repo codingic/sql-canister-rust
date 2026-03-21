@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { read, utils, write } from 'xlsx';
-import { queryResultToSqlText, queryResultToXlsxBytes } from '../frontend/exporter.js';
+import { queryResultToSqlText, queryResultToTsvText, queryResultToXlsxBytes } from '../frontend/exporter.js';
 import { workbookToSqlText } from '../frontend/importer.js';
 
 function runCase(name, fn) {
@@ -79,4 +79,19 @@ runCase('query result exports to xlsx bytes', () => {
     [1, '张三', 88.5, null],
     [2, '李四', 91, 'VIP'],
   ]);
+});
+
+runCase('query result exports to tsv text', () => {
+  const tsvText = queryResultToTsvText(
+    ['编号', '姓名', '备注'],
+    [
+      [{ Integer: 1 }, { Text: '张三' }, { Text: '普通客户' }],
+      [{ Integer: 2 }, { Text: '李四' }, { Text: '包含\n换行' }],
+    ]
+  );
+
+  assert.equal(
+    tsvText,
+    ['编号\t姓名\t备注', '1\t张三\t普通客户', '2\t李四\t"包含\n换行"'].join('\n')
+  );
 });
